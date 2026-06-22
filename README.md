@@ -31,8 +31,8 @@ for horizontal scaling.
   (only channel members, or the uploader for unattached files).
 - **Presence** — live online/offline tracking over WebSocket, with a stored
   `last_seen` fallback.
-- **Notifications** — mentions, thread replies, DMs, and channel invites,
-  delivered in real time and persisted for later retrieval.
+- **Notifications** — mentions and thread replies, delivered in real time and
+  persisted for later retrieval
 - **Webhooks** — outbound HTTP subscriptions to message events, signed with
   **HMAC-SHA256** (`X-Signature: sha256=…`).
 - **Realtime** — a single WebSocket endpoint streams typed events; an internal
