@@ -1,0 +1,102 @@
+[package]
+name = "rsmc-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSMC Engine Contributors"]
+description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"
+license = "MIT"
+repository = "https://github.com/example/rsmc-engine"
+readme = "README.md"
+
+[[bin]]
+name = "rsmc-engine"
+path = "src/main.rs"
+
+[lib]
+name = "rsmc_engine"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+
+# HTTP / WebSocket server
+axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
+hyper = { version = "1.4", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# IDs & encoding
+uuid = { version = "1.10", features = ["v4", "serde"] }
+base64 = "0.22"
+
+# Auth
+jsonwebtoken = "9.3"
+argon2 = "0.5"
+rand = "0.8"
+
+# Redis pub/sub (optional scaling)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"], optional = true }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config
+config = { version = "0.14", default-features = false, features = ["toml"] }
+dotenvy = "0.15"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Validation
+validator = { version = "0.18", features = ["derive"] }
+
+# HTTP client for webhooks
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Utilities
+futures = "0.3"
+async-trait = "0.1"
+once_cell = "1.20"
+dashmap = "6.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio-tungstenite = "0.24"
+http-body-util = "0.1"
+mime = "0.3"
+
+[features]
+default = ["redis-pubsub"]
+redis-pubsub = ["dep:redis"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0

@@ -1,0 +1,48 @@
+# =============================================================================
+# collab-engine — config.toml (optional)
+# =============================================================================
+# This file is OPTIONAL. If present in the working directory it is loaded as a
+# base layer, then overridden by APP__* environment variables and the bare
+# DATABASE_URL / JWT_SECRET / REDIS_URL / PORT vars.
+#
+# Copy to `config.toml` and edit, or skip it entirely and configure via env.
+# Secrets (jwt_secret, database url with password) are best supplied via the
+# environment rather than committed here.
+# =============================================================================
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Allowed CORS origins. Use ["*"] for permissive any-origin (no credentials),
+# or an explicit list to allow credentialed cross-origin requests.
+cors_origins = ["*"]
+# Max request body size in bytes (also caps multipart uploads). 25 MiB.
+max_body_bytes = 26214400
+
+[database]
+# Prefer setting this via DATABASE_URL env var in real deployments.
+url = "postgres://collab:collab@localhost:5432/collab"
+max_connections = 20
+min_connections = 2
+acquire_timeout_secs = 10
+# Run pending SQL migrations automatically on startup.
+auto_migrate = true
+
+[auth]
+# Prefer setting this via JWT_SECRET env var. Must be >= 16 characters.
+jwt_secret = "change-me-to-a-long-random-secret-value"
+access_token_ttl_secs = 3600      # 1 hour
+refresh_token_ttl_secs = 2592000  # 30 days
+
+[storage]
+upload_dir = "./uploads"
+max_file_bytes = 26214400         # 25 MiB
+
+[redis]
+# Optional. Omit (or comment out) to run single-instance. When set, realtime
+# events are fanned out across instances via pub/sub.
+# url = "redis://localhost:6379"
+
+[logging]
+format = "text"   # "text" for human-readable, "json" for structured logs
+level = "info"    # error | warn | info | debug | trace

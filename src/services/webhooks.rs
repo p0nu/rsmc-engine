@@ -1,0 +1,244 @@
+//! Outgoing webhook delivery.
+//!
+//! Maps internal [`ServerEvent`]s to public event names + JSON payloads,
+//! looks up matching subscriptions, and POSTs signed deliveries.
+
+use crate::db::Db;
+use crate::error::AppResult;
+use crate::models::webhook::Webhook;
+use crate::models::ws_protocol::ServerEvent;
+use chrono::Utc;
+use once_cell::sync::Lazy;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("rsmc-engine-webhooks/0.1")
+        .build()
+        .expect("failed to build webhook http client")
+});
+
+/// Translate a realtime event into a public webhook event name and payload.
+/// Returns `None` for events that are not exposed to integrations (e.g. typing).
+pub fn event_descriptor(event: &ServerEvent) -> Option<(&'static str, Value)> {
+    match event {
+        ServerEvent::MessageCreated { channel_id, message } => Some((
+            "message.created",
+            json!({ "channel_id": channel_id, "message": message }),
+        )),
+        ServerEvent::MessageUpdated { channel_id, message } => Some((
+            "message.updated",
+            json!({ "channel_id": channel_id, "message": message }),
+        )),
+        ServerEvent::MessageDeleted { channel_id, message_id } => Some((
+            "message.deleted",
+            json!({ "channel_id": channel_id, "message_id": message_id }),
+        )),
+        _ => None,
+    }
+}
+
+/// Hex HMAC-SHA256 of a body with a webhook secret (dependency-free).
+fn sign(secret: &[u8], body: &[u8]) -> String {
+    hmac_sha256::hex(secret, body)
+}
+
+/// Look up webhooks matching the channel scope + event and deliver to each.
+pub async fn deliver(
+    db: &Db,
+    channel_id: Option<Uuid>,
+    event_name: &str,
+    payload: Value,
+) -> AppResult<()> {
+    // Match webhooks that are instance-wide (channel_id IS NULL) or scoped to
+    // this channel, are active, and subscribe to this event.
+    let hooks: Vec<Webhook> = sqlx::query_as::<_, Webhook>(
+        r#"
+        SELECT id, owner_id, channel_id, target_url, events, secret, is_active, created_at
+        FROM webhooks
+        WHERE is_active
+          AND ($1 = ANY(events))
+          AND (channel_id IS NULL OR channel_id = $2)
+        "#,
+    )
+    .bind(event_name)
+    .bind(channel_id)
+    .fetch_all(db)
+    .await?;
+
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    let envelope = json!({
+        "event": event_name,
+        "timestamp": Utc::now(),
+        "data": payload,
+    });
+    let body = serde_json::to_vec(&envelope)?;
+
+    for hook in hooks {
+        let signature = sign(hook.secret.as_bytes(), &body);
+        let body = body.clone();
+        let url = hook.target_url.clone();
+        // Each delivery is independent; failures are logged, not propagated.
+        tokio::spawn(async move {
+            let res = HTTP
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("X-RSMC-Event", "delivery")
+                .header("X-Signature", format!("sha256={signature}"))
+                .body(body)
+                .send()
+                .await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    tracing::debug!(%url, "webhook delivered")
+                }
+                Ok(r) => tracing::warn!(%url, status = %r.status(), "webhook non-2xx"),
+                Err(e) => tracing::warn!(%url, error = %e, "webhook request failed"),
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Minimal HMAC-SHA256 implementation (FIPS 198-1) used for webhook signing.
+mod hmac_sha256 {
+    /// Returns lowercase hex HMAC-SHA256(key, msg).
+    pub fn hex(key: &[u8], msg: &[u8]) -> String {
+        let mac = mac(key, msg);
+        let mut s = String::with_capacity(64);
+        for b in mac {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    fn mac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+        const BLOCK: usize = 64;
+        let mut k = [0u8; BLOCK];
+        if key.len() > BLOCK {
+            let h = sha256(key);
+            k[..32].copy_from_slice(&h);
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; BLOCK];
+        let mut opad = [0x5cu8; BLOCK];
+        for i in 0..BLOCK {
+            ipad[i] ^= k[i];
+            opad[i] ^= k[i];
+        }
+        let mut inner = Vec::with_capacity(BLOCK + msg.len());
+        inner.extend_from_slice(&ipad);
+        inner.extend_from_slice(msg);
+        let inner_hash = sha256(&inner);
+        let mut outer = Vec::with_capacity(BLOCK + 32);
+        outer.extend_from_slice(&opad);
+        outer.extend_from_slice(&inner_hash);
+        sha256(&outer)
+    }
+
+    // SHA-256 (FIPS 180-4).
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+
+        let mut msg = data.to_vec();
+        let bit_len = (data.len() as u64) * 8;
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for (i, word) in chunk.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let mut v = h;
+            for i in 0..64 {
+                let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+                let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+                let t1 = v[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+                let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+                let t2 = s0.wrapping_add(maj);
+                v[7] = v[6];
+                v[6] = v[5];
+                v[5] = v[4];
+                v[4] = v[3].wrapping_add(t1);
+                v[3] = v[2];
+                v[2] = v[1];
+                v[1] = v[0];
+                v[0] = t1.wrapping_add(t2);
+            }
+            for i in 0..8 {
+                h[i] = h[i].wrapping_add(v[i]);
+            }
+        }
+
+        let mut out = [0u8; 32];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sha256_known_vector() {
+            // SHA-256("abc")
+            let h = sha256(b"abc");
+            let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                hex,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
+
+        #[test]
+        fn hmac_known_vector() {
+            // RFC 4231 test case 2.
+            let sig = hex(b"Jefe", b"what do ya want for nothing?");
+            assert_eq!(
+                sig,
+                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+            );
+        }
+    }
+}

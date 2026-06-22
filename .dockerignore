@@ -1,0 +1,22 @@
+# Build artifacts (rebuilt inside the image)
+target/
+**/*.rs.bk
+
+# Local environment & secrets — never bake into the image
+.env
+*.env
+!.env.example
+
+# Local uploads and runtime data
+uploads/
+*.log
+
+# VCS / editor noise
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Docs and CI are not needed at build time
+docs/
+.github/

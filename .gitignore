@@ -1,0 +1,35 @@
+# ---- Secrets / local config (NEVER commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+
+# ---- Rust build artifacts ----
+/target
+**/*.rs.bk
+*.pdb
+
+# ---- Runtime data ----
+/uploads
+/backups
+*.dump
+*.sql.gz
+
+# ---- Logs & local archives ----
+*.log
+*.tar.gz
+
+# ---- Local config overrides ----
+config.toml
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
