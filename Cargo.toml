@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["RSMC Engine Contributors"]
 description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"
 license = "MIT"
-repository = "https://github.com/example/rsmc-engine"
+repository = "https://github.com/p0nu/rsmc-engine"
 readme = "README.md"
 
 [[bin]]
