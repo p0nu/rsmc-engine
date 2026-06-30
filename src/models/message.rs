@@ -20,7 +20,15 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
 }
 
-/// Message enriched with author info and attachments for API responses.
+/// Aggregated reactions for one emoji on a message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionGroup {
+    pub emoji: String,
+    pub count: i64,
+    pub user_ids: Vec<Uuid>,
+}
+
+/// Message enriched with author info, attachments, and reactions for API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageView {
     #[serde(flatten)]
@@ -28,6 +36,14 @@ pub struct MessageView {
     pub author: super::user::UserPublic,
     #[serde(default)]
     pub attachments: Vec<super::file::Attachment>,
+    #[serde(default)]
+    pub reactions: Vec<ReactionGroup>,
+}
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct ReactionRequest {
+    #[validate(length(min = 1, max = 32))]
+    pub emoji: String,
 }
 
 #[derive(Debug, Deserialize, Validate)]

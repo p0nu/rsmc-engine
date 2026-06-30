@@ -32,6 +32,10 @@ pub enum ServerEvent {
     MessageUpdated { channel_id: Uuid, message: Box<MessageView> },
     /// A message was deleted.
     MessageDeleted { channel_id: Uuid, message_id: Uuid },
+    /// A reaction was added to a message.
+    ReactionAdded { channel_id: Uuid, message_id: Uuid, emoji: String, user_id: Uuid },
+    /// A reaction was removed from a message.
+    ReactionRemoved { channel_id: Uuid, message_id: Uuid, emoji: String, user_id: Uuid },
     /// Someone is typing in a channel.
     Typing { channel_id: Uuid, user_id: Uuid },
     /// A user's presence changed.

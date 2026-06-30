@@ -67,6 +67,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/channels/direct", post(handlers::channels::create_direct))
         .route(
+            "/channels/:id/read",
+            post(handlers::channels::mark_read),
+        )
+        .route(
             "/channels/:id",
             get(handlers::channels::get_channel).patch(handlers::channels::update_channel),
         )
@@ -87,6 +91,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/messages/:id",
             patch(handlers::messages::edit_message).delete(handlers::messages::delete_message),
+        )
+        .route(
+            "/messages/:id/reactions",
+            post(handlers::messages::add_reaction).delete(handlers::messages::remove_reaction),
         )
         // ---- files ----
         .route("/files", post(handlers::files::upload))

@@ -74,3 +74,13 @@ pub struct UpdateChannelRequest {
 pub struct AddMemberRequest {
     pub user_id: Uuid,
 }
+
+/// A channel plus the caller's read state, for the channel-list view.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ChannelWithMeta {
+    #[serde(flatten)]
+    #[sqlx(flatten)]
+    pub channel: Channel,
+    pub unread_count: i64,
+    pub last_read_at: Option<DateTime<Utc>>,
+}

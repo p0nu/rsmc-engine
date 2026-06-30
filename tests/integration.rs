@@ -248,13 +248,14 @@ async fn channel_create_send_and_history() {
     .await;
     let token = signup["access_token"].as_str().unwrap().to_string();
 
-    // Create a public channel.
+    // Create a public channel. (Signup already auto-creates the "general"
+    // default channel for the first user, so use a distinct name here.)
     let (status, channel) = send(
         &app,
         "POST",
         "/api/v1/channels",
         Some(&token),
-        Some(json!({ "name": "general", "topic": "watercooler", "private": false })),
+        Some(json!({ "name": "engineering", "topic": "watercooler", "private": false })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "create channel failed: {channel}");
@@ -302,4 +303,259 @@ async fn unauthenticated_requests_are_rejected() {
 
     let (status, _) = send(&app, "GET", "/api/v1/channels", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Regression test for the v0.2.0 unread-badge bugs: a single DM must produce a
+/// per-channel unread_count of exactly 1 (never 2), exactly one unread
+/// notification, and `POST /channels/:id/read` must clear BOTH surfaces so the
+/// counts can't get stuck out of step.
+#[tokio::test]
+async fn dm_unread_count_is_single_and_mark_read_clears_it() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    // Two users: alice (first → admin) and bob.
+    let mut tokens = Vec::new();
+    let mut ids = Vec::new();
+    for (email, user) in [("alice@example.com", "alice"), ("bob@example.com", "bob")] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/signup",
+            None,
+            Some(json!({
+                "email": email,
+                "username": user,
+                "display_name": user,
+                "password": "supersecret"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "signup failed: {body}");
+        tokens.push(body["access_token"].as_str().unwrap().to_string());
+        ids.push(body["user"]["id"].as_str().unwrap().to_string());
+    }
+    let (alice_token, bob_token) = (&tokens[0], &tokens[1]);
+    let bob_id = &ids[1];
+
+    // Alice opens a DM with Bob and sends ONE message.
+    let (status, dm) = send(
+        &app,
+        "POST",
+        "/api/v1/channels/direct",
+        Some(alice_token),
+        Some(json!({ "user_id": bob_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create direct failed: {dm}");
+    let dm_id = dm["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{dm_id}/messages"),
+        Some(alice_token),
+        Some(json!({ "content": "Hello" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // From Bob's side: exactly ONE unread on the DM channel (the reported bug
+    // produced 2), and exactly one unread notification.
+    let (status, channels) = send(&app, "GET", "/api/v1/channels", Some(bob_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let dm_row = channels
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == dm_id.as_str())
+        .expect("bob should see the DM channel");
+    assert_eq!(
+        dm_row["unread_count"], 1,
+        "a single DM must count as exactly 1 unread, got: {}",
+        dm_row["unread_count"]
+    );
+
+    let (status, count) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications/unread_count",
+        Some(bob_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count["unread"], 1, "exactly one DM notification expected");
+
+    // Bob marks the channel read. This must clear BOTH the per-channel badge and
+    // the notification count in one shot (the fix for the "stuck at 1" bug).
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{dm_id}/read"),
+        Some(bob_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, channels) = send(&app, "GET", "/api/v1/channels", Some(bob_token), None).await;
+    let dm_row = channels
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == dm_id.as_str())
+        .unwrap();
+    assert_eq!(dm_row["unread_count"], 0, "channel unread should be cleared");
+
+    let (_, count) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications/unread_count",
+        Some(bob_token),
+        None,
+    )
+    .await;
+    assert_eq!(count["unread"], 0, "notification count should be cleared too");
+
+    // Sending another DM after read advances the badge back to 1, proving the
+    // read cursor moved (not just a one-time zeroing).
+    let (_, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{dm_id}/messages"),
+        Some(alice_token),
+        Some(json!({ "content": "second" })),
+    )
+    .await;
+    let (_, channels) = send(&app, "GET", "/api/v1/channels", Some(bob_token), None).await;
+    let dm_row = channels
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == dm_id.as_str())
+        .unwrap();
+    assert_eq!(dm_row["unread_count"], 1, "new message after read = 1 unread");
+}
+
+/// Regression test for the thread reply-count bug: posting ONE reply must bump
+/// the parent's reply_count to exactly 1 (the UI was showing 4 for a single
+/// reply). Verifies the server is authoritative and increments once per reply.
+#[tokio::test]
+async fn thread_reply_count_increments_once_per_reply() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, signup) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "threader@example.com",
+            "username": "threader",
+            "display_name": "Threader",
+            "password": "supersecret"
+        })),
+    )
+    .await;
+    let token = signup["access_token"].as_str().unwrap().to_string();
+
+    let (_, channel) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&token),
+        Some(json!({ "name": "threads", "topic": null, "private": false })),
+    )
+    .await;
+    let channel_id = channel["id"].as_str().unwrap().to_string();
+
+    // Root message.
+    let (_, root) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{channel_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "root" })),
+    )
+    .await;
+    let root_id = root["id"].as_str().unwrap().to_string();
+    assert_eq!(root["reply_count"], 0, "fresh root has zero replies");
+
+    // Post exactly ONE reply.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{channel_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "first reply", "parent_id": root_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Root's reply_count must be exactly 1 (history reflects the server value).
+    let (_, history) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{channel_id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let root_view = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == root_id.as_str())
+        .expect("root in history");
+    assert_eq!(
+        root_view["reply_count"], 1,
+        "one reply must yield reply_count == 1, got {}",
+        root_view["reply_count"]
+    );
+
+    // The thread endpoint returns exactly one reply.
+    let (_, replies) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/messages/{root_id}/thread"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(replies.as_array().unwrap().len(), 1, "exactly one reply stored");
+
+    // A second reply makes it 2 — proving linear, once-per-reply counting.
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{channel_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "second reply", "parent_id": root_id })),
+    )
+    .await;
+    let (_, history2) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{channel_id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let root_view2 = history2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == root_id.as_str())
+        .unwrap();
+    assert_eq!(root_view2["reply_count"], 2, "two replies => reply_count == 2");
 }

@@ -7,7 +7,8 @@ use crate::models::channel::{
     UpdateChannelRequest,
 };
 use crate::models::user::{MemberRole, Permission};
-use crate::services::access;
+use crate::models::notification::NotificationKind;
+use crate::services::{access, notifications};
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -136,14 +137,64 @@ pub async fn create_direct(
     Ok(Json(channel))
 }
 
-/// `GET /api/v1/channels` — list channels the current user belongs to.
+/// `POST /api/v1/channels/:id/read` — advance the caller's read cursor to now.
+///
+/// History loading already advances `last_read_at`, but when a channel is the
+/// active view, live messages arrive without re-fetching history. The client
+/// calls this so the server's unread accounting stays in step with what the
+/// user has actually seen on screen.
+pub async fn mark_read(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    access::require_member(&state.db, id, user.id).await?;
+    sqlx::query(
+        "UPDATE channel_members SET last_read_at = now() WHERE channel_id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+
+    // Also clear any unread notifications tied to this channel so the two
+    // unread surfaces (per-channel + global notifications) can't disagree.
+    sqlx::query(
+        r#"
+        UPDATE notifications
+        SET read_at = now()
+        WHERE user_id = $1
+          AND read_at IS NULL
+          AND (payload->>'channel_id')::uuid = $2
+        "#,
+    )
+    .bind(user.id)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `GET /api/v1/channels` — list channels the current user belongs to, each
+/// annotated with the caller's unread count and last-read timestamp.
 pub async fn list_channels(
     State(state): State<AppState>,
     user: AuthUser,
-) -> AppResult<Json<Vec<Channel>>> {
-    let channels: Vec<Channel> = sqlx::query_as::<_, Channel>(
+) -> AppResult<Json<Vec<crate::models::channel::ChannelWithMeta>>> {
+    let channels = sqlx::query_as::<_, crate::models::channel::ChannelWithMeta>(
         r#"
-        SELECT c.id, c.name, c.topic, c.channel_type, c.created_by, c.created_at, c.updated_at
+        SELECT c.id, c.name, c.topic, c.channel_type, c.created_by,
+               c.created_at, c.updated_at,
+               m.last_read_at,
+               (
+                   SELECT COUNT(*)
+                   FROM messages msg
+                   WHERE msg.channel_id = c.id
+                     AND msg.deleted_at IS NULL
+                     AND msg.user_id <> $1
+                     AND (m.last_read_at IS NULL OR msg.created_at > m.last_read_at)
+               ) AS unread_count
         FROM channels c
         JOIN channel_members m ON m.channel_id = c.id
         WHERE m.user_id = $1
@@ -231,7 +282,7 @@ pub async fn add_member(
     Json(req): Json<AddMemberRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     access::require_channel_admin(&state.db, id, user.id).await?;
-    sqlx::query(
+    let res = sqlx::query(
         "INSERT INTO channel_members (channel_id, user_id, role)
          VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING",
     )
@@ -239,6 +290,18 @@ pub async fn add_member(
     .bind(req.user_id)
     .execute(&state.db)
     .await?;
+
+    // Notify the invited user only if newly added and not adding themselves.
+    if res.rows_affected() > 0 && req.user_id != user.id {
+        let _ = notifications::notify(
+            &state.db,
+            &state.events,
+            req.user_id,
+            NotificationKind::ChannelInvite,
+            serde_json::json!({ "channel_id": id, "actor_id": user.id }),
+        )
+        .await;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

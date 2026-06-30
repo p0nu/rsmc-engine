@@ -1,6 +1,6 @@
 [package]
 name = "rsmc-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["RSMC Engine Contributors"]
 description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"

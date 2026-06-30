@@ -3,7 +3,8 @@
 use crate::error::{AppError, AppResult};
 use crate::middleware::{AuthUser, ValidatedJson};
 use crate::models::message::{
-    EditMessageRequest, HistoryQuery, HistoryResponse, Message, MessageView, SendMessageRequest,
+    EditMessageRequest, HistoryQuery, HistoryResponse, Message, MessageView, ReactionRequest,
+    SendMessageRequest,
 };
 use crate::models::notification::NotificationKind;
 use crate::models::user::{Permission, UserPublic};
@@ -64,6 +65,37 @@ async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResult<Vec<Messa
         att_map.entry(row.message_id).or_default().push(row.att);
     }
 
+    // Fetch + group reactions for these messages (ordered by first-reacted).
+    #[derive(sqlx::FromRow)]
+    struct ReactRow {
+        message_id: Uuid,
+        user_id: Uuid,
+        emoji: String,
+    }
+    let react_rows: Vec<ReactRow> = sqlx::query_as::<_, ReactRow>(
+        "SELECT message_id, user_id, emoji FROM reactions WHERE message_id = ANY($1) ORDER BY created_at",
+    )
+    .bind(&message_ids)
+    .fetch_all(&state.db)
+    .await?;
+    let mut react_map: std::collections::HashMap<
+        Uuid,
+        Vec<crate::models::message::ReactionGroup>,
+    > = std::collections::HashMap::new();
+    for row in react_rows {
+        let groups = react_map.entry(row.message_id).or_default();
+        if let Some(g) = groups.iter_mut().find(|g| g.emoji == row.emoji) {
+            g.count += 1;
+            g.user_ids.push(row.user_id);
+        } else {
+            groups.push(crate::models::message::ReactionGroup {
+                emoji: row.emoji,
+                count: 1,
+                user_ids: vec![row.user_id],
+            });
+        }
+    }
+
     Ok(messages
         .into_iter()
         .map(|m| {
@@ -72,10 +104,12 @@ async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResult<Vec<Messa
                 .cloned()
                 .unwrap_or_else(|| placeholder_user(m.user_id));
             let attachments = att_map.remove(&m.id).unwrap_or_default();
+            let reactions = react_map.remove(&m.id).unwrap_or_default();
             MessageView {
                 message: m,
                 author,
                 attachments,
+                reactions,
             }
         })
         .collect())
@@ -206,6 +240,43 @@ async fn dispatch_notifications(
     view: &MessageView,
     parent_id: Option<Uuid>,
 ) {
+    // Direct-message notification: notify the other member(s) of a DM channel.
+    if parent_id.is_none() {
+        if let Ok(Some(ctype)) = sqlx::query_scalar::<_, String>(
+            "SELECT channel_type::text FROM channels WHERE id = $1",
+        )
+        .bind(channel_id)
+        .fetch_optional(&state.db)
+        .await
+        {
+            if ctype == "direct" {
+                if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT user_id FROM channel_members WHERE channel_id = $1 AND user_id <> $2",
+                )
+                .bind(channel_id)
+                .bind(view.message.user_id)
+                .fetch_all(&state.db)
+                .await
+                {
+                    for uid in members {
+                        let _ = notifications::notify(
+                            &state.db,
+                            &state.events,
+                            uid,
+                            NotificationKind::DirectMessage,
+                            serde_json::json!({
+                                "channel_id": channel_id,
+                                "message_id": view.message.id,
+                                "actor_id": view.message.user_id,
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
     // Notify thread root author of a new reply.
     if let Some(parent) = parent_id {
         if let Ok(Some(author)) =
@@ -439,5 +510,81 @@ pub async fn delete_message(
             message_id,
         },
     );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Resolve the channel a (non-deleted) message belongs to, or 404.
+async fn message_channel(state: &AppState, message_id: Uuid) -> AppResult<Uuid> {
+    let channel_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT channel_id FROM messages WHERE id = $1 AND deleted_at IS NULL")
+            .bind(message_id)
+            .fetch_optional(&state.db)
+            .await?;
+    channel_id.ok_or_else(|| AppError::NotFound("message".into()))
+}
+
+/// `POST /api/v1/messages/:id/reactions` — add an emoji reaction.
+pub async fn add_reaction(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(message_id): Path<Uuid>,
+    ValidatedJson(req): ValidatedJson<ReactionRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let channel_id = message_channel(&state, message_id).await?;
+    access::require_member(&state.db, channel_id, user.id).await?;
+
+    let res = sqlx::query(
+        "INSERT INTO reactions (id, message_id, user_id, emoji) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (message_id, user_id, emoji) DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .bind(message_id)
+    .bind(user.id)
+    .bind(&req.emoji)
+    .execute(&state.db)
+    .await?;
+
+    if res.rows_affected() > 0 {
+        state.events.emit_channel(
+            channel_id,
+            ServerEvent::ReactionAdded {
+                channel_id,
+                message_id,
+                emoji: req.emoji.clone(),
+                user_id: user.id,
+            },
+        );
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `DELETE /api/v1/messages/:id/reactions` — remove the caller's reaction.
+pub async fn remove_reaction(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(message_id): Path<Uuid>,
+    ValidatedJson(req): ValidatedJson<ReactionRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let channel_id = message_channel(&state, message_id).await?;
+    access::require_member(&state.db, channel_id, user.id).await?;
+
+    let res = sqlx::query("DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3")
+        .bind(message_id)
+        .bind(user.id)
+        .bind(&req.emoji)
+        .execute(&state.db)
+        .await?;
+
+    if res.rows_affected() > 0 {
+        state.events.emit_channel(
+            channel_id,
+            ServerEvent::ReactionRemoved {
+                channel_id,
+                message_id,
+                emoji: req.emoji.clone(),
+                user_id: user.id,
+            },
+        );
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }

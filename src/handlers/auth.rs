@@ -63,7 +63,74 @@ pub async fn signup(
     .fetch_one(&state.db)
     .await?;
 
+    // Default channel: the first user creates "general" (and owns it); every
+    // user is then auto-added as a member so the workspace is never empty.
+    // Best-effort — a failure here must not block account creation.
+    if let Err(e) = ensure_default_membership(&state, user.id, role).await {
+        tracing::warn!(error = %e, "could not add user to default channel");
+    }
+
     issue_session(&state, &user).await
+}
+
+/// Name of the channel every new user is automatically added to.
+const DEFAULT_CHANNEL: &str = "general";
+
+/// Ensure the default channel exists (creating it owned by `user_id` if this is
+/// the first user) and that `user_id` is a member of it.
+async fn ensure_default_membership(
+    state: &AppState,
+    user_id: Uuid,
+    role: UserRole,
+) -> AppResult<()> {
+    // Find the default channel, or create it if missing. Only the first admin
+    // (who has no one to inherit it from) creates it, as its owner.
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE name = $1 AND channel_type = 'public'",
+    )
+    .bind(DEFAULT_CHANNEL)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (channel_id, join_role) = match existing {
+        Some(id) => (id, crate::models::user::MemberRole::Member),
+        None => {
+            // Create it. The creator (first user, an admin) joins as owner.
+            // A rare race (two simultaneous first-signups) is caught by the
+            // unique index on channel name and surfaces as a non-fatal warning.
+            let id: Uuid = sqlx::query_scalar(
+                r#"
+                INSERT INTO channels (id, name, topic, channel_type, created_by)
+                VALUES ($1, $2, $3, 'public', $4)
+                RETURNING id
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(DEFAULT_CHANNEL)
+            .bind("Workspace-wide channel for everyone")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
+            let r = if matches!(role, UserRole::Admin) {
+                crate::models::user::MemberRole::Owner
+            } else {
+                crate::models::user::MemberRole::Member
+            };
+            (id, r)
+        }
+    };
+
+    sqlx::query(
+        "INSERT INTO channel_members (channel_id, user_id, role)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(join_role)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
 }
 
 /// `POST /api/v1/auth/login`
