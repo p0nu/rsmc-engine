@@ -38,6 +38,9 @@ pub enum ServerEvent {
     ReactionRemoved { channel_id: Uuid, message_id: Uuid, emoji: String, user_id: Uuid },
     /// Someone is typing in a channel.
     Typing { channel_id: Uuid, user_id: Uuid },
+    /// A member advanced their read cursor (read receipt). `last_read_at` is the
+    /// new cursor position; other members use it to render "Seen" / "Seen by N".
+    Read { channel_id: Uuid, user_id: Uuid, last_read_at: DateTime<Utc> },
     /// A user's presence changed.
     Presence { user_id: Uuid, online: bool, last_seen: DateTime<Utc> },
     /// A notification was created for this user.

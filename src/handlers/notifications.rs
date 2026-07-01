@@ -62,7 +62,7 @@ pub async fn mark_read(
     .bind(user.id)
     .execute(&state.db)
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
 
 /// `POST /api/v1/notifications/read_all`
@@ -74,5 +74,5 @@ pub async fn mark_all_read(
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }

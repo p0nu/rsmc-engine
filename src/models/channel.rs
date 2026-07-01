@@ -84,3 +84,10 @@ pub struct ChannelWithMeta {
     pub unread_count: i64,
     pub last_read_at: Option<DateTime<Utc>>,
 }
+
+/// One member's read cursor, used to render read receipts on the client.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ReadReceipt {
+    pub user_id: Uuid,
+    pub last_read_at: DateTime<Utc>,
+}

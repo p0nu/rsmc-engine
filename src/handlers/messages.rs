@@ -510,7 +510,7 @@ pub async fn delete_message(
             message_id,
         },
     );
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
 
 /// Resolve the channel a (non-deleted) message belongs to, or 404.
@@ -555,7 +555,7 @@ pub async fn add_reaction(
             },
         );
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
 
 /// `DELETE /api/v1/messages/:id/reactions` — remove the caller's reaction.
@@ -586,5 +586,5 @@ pub async fn remove_reaction(
             },
         );
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }

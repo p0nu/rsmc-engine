@@ -222,7 +222,7 @@ pub async fn logout(State(state): State<AppState>, user: AuthUser) -> AppResult<
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
 
 /// Shared helper: mint tokens, persist the refresh token, and build response.

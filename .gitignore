@@ -10,6 +10,7 @@ secrets/
 
 # ---- Rust build artifacts ----
 /target
+/dist
 **/*.rs.bk
 *.pdb
 

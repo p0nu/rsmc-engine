@@ -559,3 +559,106 @@ async fn thread_reply_count_increments_once_per_reply() {
         .unwrap();
     assert_eq!(root_view2["reply_count"], 2, "two replies => reply_count == 2");
 }
+
+/// Read receipts: after one user reads a channel, `GET /channels/:id/receipts`
+/// reports their advanced cursor, and it sits at/after a message they've seen
+/// (so the client can render "Seen" / "Seen by N").
+#[tokio::test]
+async fn read_receipts_report_member_cursors() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let mut tokens = Vec::new();
+    let mut ids = Vec::new();
+    for (email, user) in [("r1@example.com", "reader1"), ("r2@example.com", "reader2")] {
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/signup",
+            None,
+            Some(json!({
+                "email": email, "username": user,
+                "display_name": user, "password": "supersecret"
+            })),
+        )
+        .await;
+        tokens.push(body["access_token"].as_str().unwrap().to_string());
+        ids.push(body["user"]["id"].as_str().unwrap().to_string());
+    }
+    let (a_token, b_token) = (&tokens[0], &tokens[1]);
+    let b_id = &ids[1];
+
+    // Alice opens a DM with Bob and sends a message.
+    let (_, dm) = send(
+        &app,
+        "POST",
+        "/api/v1/channels/direct",
+        Some(a_token),
+        Some(json!({ "user_id": b_id })),
+    )
+    .await;
+    let dm_id = dm["id"].as_str().unwrap().to_string();
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{dm_id}/messages"),
+        Some(a_token),
+        Some(json!({ "content": "seen test" })),
+    )
+    .await;
+
+    // Before Bob reads: no receipt for Bob (he has no cursor yet).
+    let (status, receipts) =
+        send(&app, "GET", &format!("/api/v1/channels/{dm_id}/receipts"), Some(a_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let bob_before = receipts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["user_id"] == b_id.as_str());
+    assert!(bob_before.is_none(), "bob has no read cursor before reading");
+
+    // Bob reads the DM.
+    let (status, _) =
+        send(&app, "POST", &format!("/api/v1/channels/{dm_id}/read"), Some(b_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Now Bob's receipt exists and carries a timestamp.
+    let (_, receipts) =
+        send(&app, "GET", &format!("/api/v1/channels/{dm_id}/receipts"), Some(a_token), None).await;
+    let bob_after = receipts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["user_id"] == b_id.as_str())
+        .expect("bob should have a read receipt after reading");
+    assert!(
+        bob_after["last_read_at"].is_string(),
+        "receipt carries a last_read_at timestamp"
+    );
+
+    // A non-member cannot read receipts.
+    let (_, outsider) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "out@example.com", "username": "outsider",
+            "display_name": "Outsider", "password": "supersecret"
+        })),
+    )
+    .await;
+    let out_token = outsider["access_token"].as_str().unwrap();
+    let (status, _) =
+        send(&app, "GET", &format!("/api/v1/channels/{dm_id}/receipts"), Some(out_token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-members cannot see read receipts"
+    );
+}

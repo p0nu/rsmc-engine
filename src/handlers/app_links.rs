@@ -82,5 +82,5 @@ pub async fn delete_app_link(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound("app link".into()));
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }

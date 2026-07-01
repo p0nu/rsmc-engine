@@ -71,6 +71,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::channels::mark_read),
         )
         .route(
+            "/channels/:id/receipts",
+            get(handlers::channels::list_receipts),
+        )
+        .route(
             "/channels/:id",
             get(handlers::channels::get_channel).patch(handlers::channels::update_channel),
         )

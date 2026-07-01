@@ -97,5 +97,5 @@ pub async fn delete_webhook(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound("webhook".into()));
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }

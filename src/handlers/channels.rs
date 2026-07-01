@@ -4,7 +4,7 @@ use crate::error::{AppError, AppResult};
 use crate::middleware::{AuthUser, ValidatedJson};
 use crate::models::channel::{
     AddMemberRequest, Channel, ChannelType, CreateChannelRequest, CreateDirectRequest,
-    UpdateChannelRequest,
+    ReadReceipt, UpdateChannelRequest,
 };
 use crate::models::user::{MemberRole, Permission};
 use crate::models::notification::NotificationKind;
@@ -149,12 +149,13 @@ pub async fn mark_read(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     access::require_member(&state.db, id, user.id).await?;
-    sqlx::query(
-        "UPDATE channel_members SET last_read_at = now() WHERE channel_id = $1 AND user_id = $2",
+    let last_read_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE channel_members SET last_read_at = now() \
+         WHERE channel_id = $1 AND user_id = $2 RETURNING last_read_at",
     )
     .bind(id)
     .bind(user.id)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await?;
 
     // Also clear any unread notifications tied to this channel so the two
@@ -173,7 +174,37 @@ pub async fn mark_read(
     .execute(&state.db)
     .await?;
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // Broadcast a read receipt to the channel so other members' "Seen" /
+    // "Seen by N" indicators update in realtime.
+    state.events.emit_channel(
+        id,
+        crate::models::ws_protocol::ServerEvent::Read {
+            channel_id: id,
+            user_id: user.id,
+            last_read_at,
+        },
+    );
+
+    Ok(super::ok())
+}
+
+/// `GET /api/v1/channels/:id/receipts` — read cursors for every member of the
+/// channel. The client compares each `last_read_at` against message timestamps
+/// to render "Seen" (DMs) or "Seen by N" (group channels).
+pub async fn list_receipts(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<ReadReceipt>>> {
+    access::require_member(&state.db, id, user.id).await?;
+    let receipts = sqlx::query_as::<_, ReadReceipt>(
+        "SELECT user_id, last_read_at FROM channel_members \
+         WHERE channel_id = $1 AND last_read_at IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(receipts))
 }
 
 /// `GET /api/v1/channels` — list channels the current user belongs to, each
@@ -302,7 +333,7 @@ pub async fn add_member(
         )
         .await;
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
 
 /// `DELETE /api/v1/channels/:id/members/:user_id`
@@ -320,5 +351,5 @@ pub async fn remove_member(
         .bind(target)
         .execute(&state.db)
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(super::ok())
 }
