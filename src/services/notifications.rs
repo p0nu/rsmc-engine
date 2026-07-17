@@ -54,6 +54,25 @@ pub fn extract_mentions(content: &str) -> Vec<String> {
     out
 }
 
+/// Detects a broadcast mention (`@channel`, `@here`, or `@everyone`) anywhere in
+/// the message. These notify every member of the channel rather than a named
+/// user. Returns true if any broadcast token is present.
+pub fn has_broadcast_mention(content: &str) -> bool {
+    for token in content.split(|c: char| c.is_whitespace() || c == ',') {
+        if let Some(name) = token.strip_prefix('@') {
+            let cleaned: String = name
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                .collect();
+            let lower = cleaned.to_lowercase();
+            if lower == "channel" || lower == "here" || lower == "everyone" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +81,16 @@ mod tests {
     fn extracts_mentions() {
         let m = extract_mentions("hey @alice and @bob_jones, ping @al");
         assert_eq!(m, vec!["alice".to_string(), "bob_jones".to_string()]);
+    }
+
+    #[test]
+    fn detects_broadcast_mentions() {
+        assert!(has_broadcast_mention("heads up @channel please read"));
+        assert!(has_broadcast_mention("@here quick sync?"));
+        assert!(has_broadcast_mention("ping @everyone"));
+        // Named mentions and lookalikes are not broadcasts.
+        assert!(!has_broadcast_mention("hey @alice"));
+        assert!(!has_broadcast_mention("no mentions here"));
+        assert!(!has_broadcast_mention("email me at foo@channelize.com"));
     }
 }

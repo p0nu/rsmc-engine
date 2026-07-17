@@ -4,7 +4,7 @@ use crate::error::{AppError, AppResult};
 use crate::middleware::{AuthUser, ValidatedJson};
 use crate::models::message::{
     EditMessageRequest, HistoryQuery, HistoryResponse, Message, MessageView, ReactionRequest,
-    SendMessageRequest,
+    SearchQuery, SearchResponse, SendMessageRequest,
 };
 use crate::models::notification::NotificationKind;
 use crate::models::user::{Permission, UserPublic};
@@ -334,6 +334,48 @@ async fn dispatch_notifications(
             }
         }
     }
+    // Broadcast mention (@channel / @here / @everyone): notify every other
+    // member of the channel. Skipped for direct channels (those already send a
+    // DirectMessage notification) and for thread replies.
+    if parent_id.is_none() && notifications::has_broadcast_mention(&view.message.content) {
+        let is_direct = sqlx::query_scalar::<_, String>(
+            "SELECT channel_type::text FROM channels WHERE id = $1",
+        )
+        .bind(channel_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t == "direct")
+        .unwrap_or(false);
+
+        if !is_direct {
+            if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
+                "SELECT user_id FROM channel_members WHERE channel_id = $1 AND user_id <> $2",
+            )
+            .bind(channel_id)
+            .bind(view.message.user_id)
+            .fetch_all(&state.db)
+            .await
+            {
+                for uid in members {
+                    let _ = notifications::notify(
+                        &state.db,
+                        &state.events,
+                        uid,
+                        NotificationKind::Mention,
+                        serde_json::json!({
+                            "channel_id": channel_id,
+                            "message_id": view.message.id,
+                            "actor_id": view.message.user_id,
+                            "broadcast": true,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 /// `GET /api/v1/channels/:id/messages` — paginated history (newest first).
@@ -351,7 +393,7 @@ pub async fn history(
         sqlx::query_as::<_, Message>(
             r#"
             SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count,
-                   m.edited_at, m.deleted_at, m.created_at
+                   m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by
             FROM messages m
             JOIN messages c ON c.id = $2
             WHERE m.channel_id = $1
@@ -370,7 +412,7 @@ pub async fn history(
         sqlx::query_as::<_, Message>(
             r#"
             SELECT id, channel_id, user_id, content, parent_id, reply_count,
-                   edited_at, deleted_at, created_at
+                   edited_at, deleted_at, created_at, pinned_at, pinned_by
             FROM messages
             WHERE channel_id = $1 AND parent_id IS NULL
             ORDER BY created_at DESC, id DESC
@@ -422,7 +464,7 @@ pub async fn thread(
     let replies: Vec<Message> = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, channel_id, user_id, content, parent_id, reply_count,
-               edited_at, deleted_at, created_at
+               edited_at, deleted_at, created_at, pinned_at, pinned_by
         FROM messages
         WHERE parent_id = $1
         ORDER BY created_at ASC
@@ -457,7 +499,7 @@ pub async fn edit_message(
         UPDATE messages SET content = $2, edited_at = now()
         WHERE id = $1
         RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                  edited_at, deleted_at, created_at
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by
         "#,
     )
     .bind(message_id)
@@ -587,4 +629,156 @@ pub async fn remove_reaction(
         );
     }
     Ok(super::ok())
+}
+
+/// `GET /api/v1/search?q=...&channel_id=...&limit=...` — full-text message
+/// search. Scoped to one channel when `channel_id` is given, otherwise across
+/// every channel the caller is a member of. Deleted messages are excluded.
+pub async fn search(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<SearchQuery>,
+) -> AppResult<Json<SearchResponse>> {
+    let term = q.q.trim();
+    if term.is_empty() {
+        return Ok(Json(SearchResponse { results: Vec::new() }));
+    }
+    let limit = q.clamped_limit();
+
+    // Rank by full-text relevance; fall back to trigram similarity so partial
+    // words still match. Restrict to channels the caller belongs to.
+    let messages: Vec<Message> = if let Some(cid) = q.channel_id {
+        access::require_member(&state.db, cid, user.id).await?;
+        sqlx::query_as::<_, Message>(
+            r#"
+            SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count,
+                   m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by
+            FROM messages m
+            WHERE m.channel_id = $1
+              AND m.deleted_at IS NULL
+              AND (to_tsvector('english', m.content) @@ websearch_to_tsquery('english', $2)
+                   OR m.content ILIKE '%' || $2 || '%')
+            ORDER BY m.created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(cid)
+        .bind(term)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, Message>(
+            r#"
+            SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count,
+                   m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by
+            FROM messages m
+            JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = $1
+            WHERE m.deleted_at IS NULL
+              AND (to_tsvector('english', m.content) @@ websearch_to_tsquery('english', $2)
+                   OR m.content ILIKE '%' || $2 || '%')
+            ORDER BY m.created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user.id)
+        .bind(term)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(Json(SearchResponse {
+        results: enrich(&state, messages).await?,
+    }))
+}
+
+/// `POST /api/v1/messages/:id/pin` — pin a message in its channel.
+pub async fn pin_message(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(message_id): Path<Uuid>,
+) -> AppResult<Json<MessageView>> {
+    let channel_id = message_channel(&state, message_id).await?;
+    access::require_member(&state.db, channel_id, user.id).await?;
+
+    let updated: Message = sqlx::query_as::<_, Message>(
+        r#"
+        UPDATE messages
+        SET pinned_at = COALESCE(pinned_at, now()), pinned_by = $2
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING id, channel_id, user_id, content, parent_id, reply_count,
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by
+        "#,
+    )
+    .bind(message_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let view = enrich(&state, vec![updated])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::NotFound("message".into()))?;
+    state
+        .events
+        .emit_channel(channel_id, ServerEvent::MessageUpdated { channel_id, message: Box::new(view.clone()) });
+    Ok(Json(view))
+}
+
+/// `DELETE /api/v1/messages/:id/pin` — unpin a message.
+pub async fn unpin_message(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(message_id): Path<Uuid>,
+) -> AppResult<Json<MessageView>> {
+    let channel_id = message_channel(&state, message_id).await?;
+    access::require_member(&state.db, channel_id, user.id).await?;
+
+    let updated: Message = sqlx::query_as::<_, Message>(
+        r#"
+        UPDATE messages
+        SET pinned_at = NULL, pinned_by = NULL
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING id, channel_id, user_id, content, parent_id, reply_count,
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by
+        "#,
+    )
+    .bind(message_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let view = enrich(&state, vec![updated])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::NotFound("message".into()))?;
+    state
+        .events
+        .emit_channel(channel_id, ServerEvent::MessageUpdated { channel_id, message: Box::new(view.clone()) });
+    Ok(Json(view))
+}
+
+/// `GET /api/v1/channels/:id/pins` — list pinned messages in a channel,
+/// newest pin first.
+pub async fn list_pins(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(channel_id): Path<Uuid>,
+) -> AppResult<Json<Vec<MessageView>>> {
+    access::require_member(&state.db, channel_id, user.id).await?;
+    let messages: Vec<Message> = sqlx::query_as::<_, Message>(
+        r#"
+        SELECT id, channel_id, user_id, content, parent_id, reply_count,
+               edited_at, deleted_at, created_at, pinned_at, pinned_by
+        FROM messages
+        WHERE channel_id = $1 AND pinned_at IS NOT NULL AND deleted_at IS NULL
+        ORDER BY pinned_at DESC
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(enrich(&state, messages).await?))
 }

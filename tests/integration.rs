@@ -662,3 +662,276 @@ async fn read_receipts_report_member_cursors() {
         "non-members cannot see read receipts"
     );
 }
+
+/// Message search finds matching messages across a member's channels and
+/// scopes correctly to a single channel when asked.
+#[tokio::test]
+async fn message_search_finds_and_scopes() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, signup) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "searcher@example.com", "username": "searcher",
+            "display_name": "Searcher", "password": "supersecret"
+        })),
+    )
+    .await;
+    let token = signup["access_token"].as_str().unwrap().to_string();
+
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&token),
+        Some(json!({ "name": "searchch", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    for body in ["the quick brown fox", "lazy dog sleeps", "quick reminder"] {
+        send(
+            &app,
+            "POST",
+            &format!("/api/v1/channels/{ch_id}/messages"),
+            Some(&token),
+            Some(json!({ "content": body })),
+        )
+        .await;
+    }
+
+    // Search for "quick" -> two hits.
+    let (status, res) =
+        send(&app, "GET", "/api/v1/search?q=quick", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = res["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "two messages contain 'quick'");
+
+    // Channel-scoped search returns the same here.
+    let (_, scoped) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/search?q=quick&channel_id={ch_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(scoped["results"].as_array().unwrap().len(), 2);
+
+    // A term nobody wrote -> no hits.
+    let (_, none) =
+        send(&app, "GET", "/api/v1/search?q=zzzznomatch", Some(&token), None).await;
+    assert_eq!(none["results"].as_array().unwrap().len(), 0);
+
+    // Empty query -> empty results, not an error.
+    let (status, empty) = send(&app, "GET", "/api/v1/search?q=", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["results"].as_array().unwrap().len(), 0);
+}
+
+/// Pinning a message surfaces it in the channel's pins list; unpinning removes it.
+#[tokio::test]
+async fn pin_and_unpin_message() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, signup) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "pinner@example.com", "username": "pinner",
+            "display_name": "Pinner", "password": "supersecret"
+        })),
+    )
+    .await;
+    let token = signup["access_token"].as_str().unwrap().to_string();
+
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&token),
+        Some(json!({ "name": "pinch", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    let (_, msg) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "pin me" })),
+    )
+    .await;
+    let msg_id = msg["id"].as_str().unwrap().to_string();
+
+    // No pins initially.
+    let (_, pins) =
+        send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
+    assert_eq!(pins.as_array().unwrap().len(), 0);
+
+    // Pin it.
+    let (status, pinned) =
+        send(&app, "POST", &format!("/api/v1/messages/{msg_id}/pin"), Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(pinned["pinned_at"].is_string(), "pinned_at is set after pinning");
+
+    let (_, pins) =
+        send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
+    let arr = pins.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "one pinned message");
+    assert_eq!(arr[0]["id"], msg_id.as_str());
+
+    // The pin must also survive a normal history reload (regression: history
+    // omitted the pin columns, so pins vanished on refresh).
+    let (_, hist) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let in_history = hist["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == msg_id.as_str())
+        .expect("message in history");
+    assert!(
+        in_history["pinned_at"].is_string(),
+        "history must report pinned_at for a pinned message"
+    );
+
+    // Unpin.
+    let (status, _) =
+        send(&app, "DELETE", &format!("/api/v1/messages/{msg_id}/pin"), Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, pins) =
+        send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
+    assert_eq!(pins.as_array().unwrap().len(), 0, "no pins after unpin");
+}
+
+/// An @channel broadcast mention notifies every other member of the channel.
+#[tokio::test]
+async fn broadcast_mention_notifies_all_members() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    // Three users: owner + two members.
+    let mut tokens = Vec::new();
+    let mut ids = Vec::new();
+    for (email, user) in [
+        ("owner@example.com", "owner"),
+        ("mem1@example.com", "memberone"),
+        ("mem2@example.com", "membertwo"),
+    ] {
+        let (_, b) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/signup",
+            None,
+            Some(json!({
+                "email": email, "username": user,
+                "display_name": user, "password": "supersecret"
+            })),
+        )
+        .await;
+        tokens.push(b["access_token"].as_str().unwrap().to_string());
+        ids.push(b["user"]["id"].as_str().unwrap().to_string());
+    }
+    let owner_token = &tokens[0];
+
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(owner_token),
+        Some(json!({ "name": "announce", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    // Add the two members.
+    for uid in [&ids[1], &ids[2]] {
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/channels/{ch_id}/members"),
+            Some(owner_token),
+            Some(json!({ "user_id": uid })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Owner posts an @channel broadcast.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "@channel standup in 5" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Both members should each have a broadcast Mention notification (they also
+    // have a channel_invite from being added, so filter by kind).
+    for mtok in [&tokens[1], &tokens[2]] {
+        let (_, notifs) = send(
+            &app,
+            "GET",
+            "/api/v1/notifications?unread_only=true&limit=50",
+            Some(mtok),
+            None,
+        )
+        .await;
+        let mentions = notifs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| {
+                n["kind"] == "mention" && n["payload"]["broadcast"] == serde_json::Value::Bool(true)
+            })
+            .count();
+        assert_eq!(mentions, 1, "each member gets exactly one broadcast mention");
+    }
+
+    // The author does not notify themselves.
+    let (_, owner_notifs) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications?unread_only=true&limit=50",
+        Some(owner_token),
+        None,
+    )
+    .await;
+    let owner_mentions = owner_notifs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "mention")
+        .count();
+    assert_eq!(owner_mentions, 0, "author is not self-notified");
+}

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] — search, pins, broadcast mentions
+
+### Added
+- **Message search** — `GET /search?q=...` runs full-text search over message
+  content. Scoped to one channel with `&channel_id=...`, otherwise across every
+  channel the caller belongs to.
+- **Pinned messages** — `POST /messages/:id/pin` and `DELETE /messages/:id/pin`
+  pin/unpin a message in its channel; `GET /channels/:id/pins` lists a channel's
+  pins newest-first.
+- **Broadcast mentions** — `@channel`, `@here`, and `@everyone` in a message
+  now notify every other member of the channel (a `mention` notification with
+  `"broadcast": true` in the payload).
+
+### Notes
+- Migration `0004` adds the FTS index and the two nullable pin columns; it
+  applies automatically on startup and is backward compatible.
+
 ## [0.3.0] — read-receipt API
 
 ### Added

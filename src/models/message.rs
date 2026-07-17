@@ -18,6 +18,15 @@ pub struct Message {
     pub edited_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// When set, this message is pinned in its channel. Populated only by
+    /// queries that select it (history/search/pins); `#[sqlx(default)]` keeps
+    /// the many existing column-list queries that omit it working unchanged.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub pinned_by: Option<Uuid>,
 }
 
 /// Aggregated reactions for one emoji on a message.
@@ -95,4 +104,29 @@ pub struct HistoryResponse {
     pub messages: Vec<MessageView>,
     /// Cursor to pass as `before` to fetch the next (older) page.
     pub next_cursor: Option<Uuid>,
+}
+
+/// Query for message search. `channel_id` scopes to one channel; when omitted,
+/// search spans every channel the caller belongs to.
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub channel_id: Option<Uuid>,
+    #[serde(default = "default_search_limit")]
+    pub limit: i64,
+}
+
+fn default_search_limit() -> i64 {
+    30
+}
+
+impl SearchQuery {
+    pub fn clamped_limit(&self) -> i64 {
+        self.limit.clamp(1, 50)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<MessageView>,
 }

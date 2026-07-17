@@ -93,6 +93,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/messages/:id/thread", get(handlers::messages::thread))
         .route(
+            "/messages/:id/pin",
+            post(handlers::messages::pin_message).delete(handlers::messages::unpin_message),
+        )
+        .route("/channels/:id/pins", get(handlers::messages::list_pins))
+        .route("/search", get(handlers::messages::search))
+        .route(
             "/messages/:id",
             patch(handlers::messages::edit_message).delete(handlers::messages::delete_message),
         )
