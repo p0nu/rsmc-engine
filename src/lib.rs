@@ -74,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
             "/channels/:id/receipts",
             get(handlers::channels::list_receipts),
         )
+        .route("/channels/:id/mute", patch(handlers::channels::set_mute))
         .route(
             "/channels/:id",
             get(handlers::channels::get_channel).patch(handlers::channels::update_channel),

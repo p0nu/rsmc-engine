@@ -935,3 +935,161 @@ async fn broadcast_mention_notifies_all_members() {
         .count();
     assert_eq!(owner_mentions, 0, "author is not self-notified");
 }
+
+/// Muting a channel suppresses notifications (including @channel broadcasts)
+/// for that member, while unread counts keep accruing.
+#[tokio::test]
+async fn muting_channel_suppresses_notifications_but_keeps_unread() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let mut tokens = Vec::new();
+    let mut ids = Vec::new();
+    for (email, user) in [("mowner@example.com", "mowner"), ("mmember@example.com", "mmember")] {
+        let (_, b) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/signup",
+            None,
+            Some(json!({
+                "email": email, "username": user,
+                "display_name": user, "password": "supersecret"
+            })),
+        )
+        .await;
+        tokens.push(b["access_token"].as_str().unwrap().to_string());
+        ids.push(b["user"]["id"].as_str().unwrap().to_string());
+    }
+    let (owner_token, member_token) = (&tokens[0], &tokens[1]);
+    let member_id = &ids[1];
+
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(owner_token),
+        Some(json!({ "name": "noisy", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/members"),
+        Some(owner_token),
+        Some(json!({ "user_id": member_id })),
+    )
+    .await;
+
+    // Member mutes the channel.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/v1/channels/{ch_id}/mute"),
+        Some(member_token),
+        Some(json!({ "muted": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mute failed: {body}");
+    assert_eq!(body["muted"], true);
+
+    // The channel list reports the muted flag for that member.
+    let (_, channels) = send(&app, "GET", "/api/v1/channels", Some(member_token), None).await;
+    let row = channels
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ch_id.as_str())
+        .expect("member sees the channel");
+    assert_eq!(row["muted"], true, "channel list reports muted");
+
+    // Count the member's existing notifications (the channel_invite from being added).
+    let (_, before) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications?unread_only=true&limit=50",
+        Some(member_token),
+        None,
+    )
+    .await;
+    let before_count = before.as_array().unwrap().len();
+
+    // Owner posts a plain message AND an @channel broadcast.
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "regular message" })),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "@channel everyone look" })),
+    )
+    .await;
+
+    // No new notifications for the muted member.
+    let (_, after) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications?unread_only=true&limit=50",
+        Some(member_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after.as_array().unwrap().len(),
+        before_count,
+        "muted member must receive no new notifications, not even @channel"
+    );
+
+    // But unread still accrues so the sidebar can show quiet activity.
+    let (_, channels) = send(&app, "GET", "/api/v1/channels", Some(member_token), None).await;
+    let row = channels
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ch_id.as_str())
+        .unwrap();
+    assert_eq!(row["unread_count"], 2, "unread keeps counting while muted");
+
+    // Unmuting restores notifications.
+    let (_, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/v1/channels/{ch_id}/mute"),
+        Some(member_token),
+        Some(json!({ "muted": false })),
+    )
+    .await;
+    assert_eq!(body["muted"], false);
+
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "@channel back on" })),
+    )
+    .await;
+    let (_, unmuted) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications?unread_only=true&limit=50",
+        Some(member_token),
+        None,
+    )
+    .await;
+    assert!(
+        unmuted.as_array().unwrap().len() > before_count,
+        "unmuted member receives notifications again"
+    );
+}

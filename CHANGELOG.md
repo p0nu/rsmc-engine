@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0] - channel mute
+
+### Added
+- **Mute channel** - `PATCH /channels/:id/mute` takes `{ "muted": true|false }`
+  and sets the mute state for the calling member only. Members-only; other
+  members are unaffected.
+- `GET /channels` now returns a `muted` flag per channel alongside
+  `unread_count` and `last_read_at`.
+- Muted members receive **no notifications** from that channel: direct
+  messages, thread replies, `@mentions`, and `@channel` broadcasts are all
+  suppressed. Unread counts continue to accrue so clients can still show
+  quiet activity.
+- Integration test covering mute suppression, unread accrual while muted, and
+  restoration on unmute.
+
+### Notes
+- Migration `0005` adds a `muted` boolean to `channel_members`, defaulting to
+  false. Additive and backward compatible; applies automatically on startup.
+
 ## [0.4.0] — search, pins, broadcast mentions
 
 ### Added

@@ -4,7 +4,7 @@ use crate::error::{AppError, AppResult};
 use crate::middleware::{AuthUser, ValidatedJson};
 use crate::models::channel::{
     AddMemberRequest, Channel, ChannelType, CreateChannelRequest, CreateDirectRequest,
-    ReadReceipt, UpdateChannelRequest,
+    MuteRequest, ReadReceipt, UpdateChannelRequest,
 };
 use crate::models::user::{MemberRole, Permission};
 use crate::models::notification::NotificationKind;
@@ -188,6 +188,26 @@ pub async fn mark_read(
     Ok(super::ok())
 }
 
+/// `PATCH /api/v1/channels/:id/mute` — mute or unmute this channel for the
+/// caller. Muting suppresses all notifications from the channel (mentions,
+/// DMs, thread replies, and `@channel` broadcasts) while still tracking unread
+/// counts, so the sidebar can show quiet activity without interrupting.
+pub async fn set_mute(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(req): Json<MuteRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    access::require_member(&state.db, id, user.id).await?;
+    sqlx::query("UPDATE channel_members SET muted = $3 WHERE channel_id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(user.id)
+        .bind(req.muted)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "muted": req.muted })))
+}
+
 /// `GET /api/v1/channels/:id/receipts` — read cursors for every member of the
 /// channel. The client compares each `last_read_at` against message timestamps
 /// to render "Seen" (DMs) or "Seen by N" (group channels).
@@ -218,6 +238,7 @@ pub async fn list_channels(
         SELECT c.id, c.name, c.topic, c.channel_type, c.created_by,
                c.created_at, c.updated_at,
                m.last_read_at,
+               m.muted,
                (
                    SELECT COUNT(*)
                    FROM messages msg

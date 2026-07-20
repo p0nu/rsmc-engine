@@ -83,6 +83,17 @@ pub struct ChannelWithMeta {
     pub channel: Channel,
     pub unread_count: i64,
     pub last_read_at: Option<DateTime<Utc>>,
+    /// Whether the requesting member has muted this channel. Muted channels
+    /// still accrue unread counts but generate no notifications.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub muted: bool,
+}
+
+/// Body for `PATCH /channels/:id/mute`.
+#[derive(Debug, Deserialize)]
+pub struct MuteRequest {
+    pub muted: bool,
 }
 
 /// One member's read cursor, used to render read receipts on the client.

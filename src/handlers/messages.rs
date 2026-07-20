@@ -251,7 +251,8 @@ async fn dispatch_notifications(
         {
             if ctype == "direct" {
                 if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
-                    "SELECT user_id FROM channel_members WHERE channel_id = $1 AND user_id <> $2",
+                    "SELECT user_id FROM channel_members \
+                     WHERE channel_id = $1 AND user_id <> $2 AND NOT muted",
                 )
                 .bind(channel_id)
                 .bind(view.message.user_id)
@@ -279,11 +280,14 @@ async fn dispatch_notifications(
 
     // Notify thread root author of a new reply.
     if let Some(parent) = parent_id {
-        if let Ok(Some(author)) =
-            sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM messages WHERE id = $1")
-                .bind(parent)
-                .fetch_optional(&state.db)
-                .await
+        if let Ok(Some(author)) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT m.user_id FROM messages m \
+             JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = m.user_id \
+             WHERE m.id = $1 AND NOT cm.muted",
+        )
+        .bind(parent)
+        .fetch_optional(&state.db)
+        .await
         {
             if author != view.message.user_id {
                 let _ = notifications::notify(
@@ -309,7 +313,7 @@ async fn dispatch_notifications(
             r#"
             SELECT u.id FROM users u
             JOIN channel_members m ON m.user_id = u.id AND m.channel_id = $2
-            WHERE LOWER(u.username) = ANY($1) AND u.id <> $3
+            WHERE LOWER(u.username) = ANY($1) AND u.id <> $3 AND NOT m.muted
             "#,
         )
         .bind(&mentions)
@@ -351,7 +355,8 @@ async fn dispatch_notifications(
 
         if !is_direct {
             if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
-                "SELECT user_id FROM channel_members WHERE channel_id = $1 AND user_id <> $2",
+                "SELECT user_id FROM channel_members \
+                 WHERE channel_id = $1 AND user_id <> $2 AND NOT muted",
             )
             .bind(channel_id)
             .bind(view.message.user_id)
