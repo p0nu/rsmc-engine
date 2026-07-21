@@ -1093,3 +1093,79 @@ async fn muting_channel_suppresses_notifications_but_keeps_unread() {
         "unmuted member receives notifications again"
     );
 }
+
+/// The admin overview endpoint reports live workspace figures and is admin-only.
+#[tokio::test]
+async fn system_stats_reports_workspace_and_is_admin_only() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, admin) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "sadmin@example.com", "username": "sadmin",
+            "display_name": "SAdmin", "password": "supersecret"
+        })),
+    )
+    .await;
+    let admin_token = admin["access_token"].as_str().unwrap().to_string();
+
+    let (_, plain) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "splain@example.com", "username": "splain",
+            "display_name": "SPlain", "password": "supersecret"
+        })),
+    )
+    .await;
+    let plain_token = plain["access_token"].as_str().unwrap();
+
+    // Non-admins are refused.
+    let (status, _) = send(&app, "GET", "/api/v1/system/stats", Some(plain_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "system stats must be admin-only");
+
+    // Create content so the counts are non-trivial.
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&admin_token),
+        Some(json!({ "name": "statschan", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+    for body in ["one", "two"] {
+        send(
+            &app,
+            "POST",
+            &format!("/api/v1/channels/{ch_id}/messages"),
+            Some(&admin_token),
+            Some(json!({ "content": body })),
+        )
+        .await;
+    }
+
+    let (status, stats) =
+        send(&app, "GET", "/api/v1/system/stats", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(stats["workspace"]["users_total"], 2);
+    assert_eq!(stats["workspace"]["users_active"], 2);
+    assert_eq!(stats["workspace"]["messages_total"], 2);
+    assert_eq!(stats["workspace"]["messages_24h"], 2);
+    assert!(stats["workspace"]["channels_public"].as_i64().unwrap() >= 1);
+
+    assert!(stats["server"]["version"].is_string());
+    assert!(stats["database"]["size_bytes"].as_i64().unwrap() > 0);
+    assert!(stats["realtime"]["online_users"].is_number());
+}

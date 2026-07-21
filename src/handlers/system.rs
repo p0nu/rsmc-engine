@@ -263,3 +263,108 @@ async fn which(bin: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// Process start time, set once at startup so uptime can be reported without
+/// threading a timestamp through `AppState`.
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Call once during bootstrap so uptime is measured from boot.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.set(std::time::Instant::now());
+}
+
+/// `GET /api/v1/system/stats` — workspace, server, and database overview for
+/// the admin console. Admin-only. All counts are cheap aggregates; nothing here
+/// exposes secrets or message content.
+pub async fn stats(
+    State(state): State<AppState>,
+    AdminUser(_admin): AdminUser,
+) -> AppResult<Json<serde_json::Value>> {
+    let db = &state.db;
+
+    let (users_total, users_active): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER (WHERE is_active) FROM users")
+            .fetch_one(db)
+            .await?;
+
+    let (ch_public, ch_private, ch_group, ch_direct): (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+          COUNT(*) FILTER (WHERE channel_type = 'public'),
+          COUNT(*) FILTER (WHERE channel_type = 'private'),
+          COUNT(*) FILTER (WHERE channel_type = 'group'),
+          COUNT(*) FILTER (WHERE channel_type = 'direct')
+        FROM channels
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    let (msgs_total, msgs_24h, msgs_7d): (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+          COUNT(*) FILTER (WHERE deleted_at IS NULL),
+          COUNT(*) FILTER (WHERE deleted_at IS NULL AND created_at > now() - interval '24 hours'),
+          COUNT(*) FILTER (WHERE deleted_at IS NULL AND created_at > now() - interval '7 days')
+        FROM messages
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    let (files_count, files_bytes): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*), SUM(size_bytes)::bigint FROM attachments")
+            .fetch_one(db)
+            .await?;
+
+    let db_size_bytes: i64 =
+        sqlx::query_scalar("SELECT pg_database_size(current_database())::bigint")
+            .fetch_one(db)
+            .await
+            .unwrap_or(0);
+    let db_version: String = sqlx::query_scalar("SHOW server_version")
+        .fetch_one(db)
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    let migration_version: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(db)
+            .await
+            .unwrap_or(None);
+
+    let uptime_seconds = PROCESS_START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+
+    Ok(Json(json!({
+        "workspace": {
+            "users_total": users_total,
+            "users_active": users_active,
+            "users_deactivated": users_total - users_active,
+            "channels_public": ch_public,
+            "channels_private": ch_private,
+            "channels_group": ch_group,
+            "channels_direct": ch_direct,
+            "messages_total": msgs_total,
+            "messages_24h": msgs_24h,
+            "messages_7d": msgs_7d,
+            "files_count": files_count,
+            "files_bytes": files_bytes.unwrap_or(0),
+        },
+        "server": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": uptime_seconds,
+            "arch": std::env::consts::ARCH,
+            "os": std::env::consts::OS,
+        },
+        "database": {
+            "size_bytes": db_size_bytes,
+            "server_version": db_version,
+            "migration_version": migration_version,
+            "pool_size": db.size(),
+            "pool_idle": db.num_idle(),
+        },
+        "realtime": {
+            "online_users": state.hub.online_count(),
+            "redis_enabled": state.config.redis.url.is_some(),
+        },
+    })))
+}

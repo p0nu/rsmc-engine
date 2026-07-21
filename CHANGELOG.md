@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0] - admin overview
+
+### Added
+- **`GET /system/stats`** - admin-only workspace, server, and database overview
+  for the admin console. Reports member counts (active/deactivated), channels by
+  type, message totals plus 24-hour and 7-day activity, file count and storage
+  used, database size, schema version, connection-pool usage, PostgreSQL
+  version, server version and uptime, and the count of currently online members.
+  All figures are cheap aggregates; nothing exposes secrets or message content.
+- Integration test covering the reported figures and admin-only access.
+
 ## [0.5.0] - channel mute
 
 ### Added

@@ -141,6 +141,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ---- system (admin) ----
         .route("/system/info", get(handlers::system::info))
+        .route("/system/stats", get(handlers::system::stats))
         .route("/system/backup", post(handlers::system::backup))
         .route("/system/backups", get(handlers::system::list_backups))
         .route("/system/restore", post(handlers::system::restore))
@@ -194,6 +195,7 @@ fn build_cors(state: &AppState) -> CorsLayer {
 /// Initialize the engine from config: DB (+migrations), JWT keys, hub, event bus,
 /// and Redis pub/sub when the `redis-pubsub` feature and a URL are set.
 pub async fn bootstrap(settings: config::Settings) -> anyhow::Result<AppState> {
+    handlers::system::mark_process_start();
     let pool = db::connect(&settings.database).await?;
     if settings.database.auto_migrate {
         db::migrate(&pool).await?;
