@@ -3,18 +3,36 @@
 use crate::error::{AppError, AppResult};
 use crate::middleware::{AuthUser, ValidatedJson};
 use crate::models::channel::{
-    AddMemberRequest, Channel, ChannelType, CreateChannelRequest, CreateDirectRequest,
-    MuteRequest, ReadReceipt, UpdateChannelRequest,
+    AddMemberRequest, BrowsableChannel, Channel, ChannelType, CreateChannelRequest,
+    CreateDirectRequest, ListChannelsQuery, MuteRequest, ReadReceipt, UpdateChannelRequest,
 };
-use crate::models::user::{MemberRole, Permission};
+use crate::models::user::{MemberRole, Permission, UserPublic};
 use crate::models::notification::NotificationKind;
+use crate::models::ws_protocol::ServerEvent;
 use crate::services::{access, notifications};
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use uuid::Uuid;
+
+/// Load a user's public projection for embedding in realtime member events.
+async fn load_public(state: &AppState, id: Uuid) -> AppResult<UserPublic> {
+    let user = sqlx::query_as::<_, crate::models::user::User>(
+        r#"
+        SELECT id, email, username, display_name, password_hash, role,
+               avatar_url, is_active, created_at, updated_at,
+               status_emoji, status_text, status_expires_at
+        FROM users WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("user".into()))?;
+    Ok(user.to_public())
+}
 
 /// `POST /api/v1/channels`
 pub async fn create_channel(
@@ -36,7 +54,8 @@ pub async fn create_channel(
         r#"
         INSERT INTO channels (id, name, topic, channel_type, created_by)
         VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at
+        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at,
+                  archived_at, archived_by
         "#,
     )
     .bind(Uuid::new_v4())
@@ -80,7 +99,7 @@ pub async fn create_channel(
     Ok(Json(channel))
 }
 
-/// `POST /api/v1/channels/direct` — create or fetch a 1:1 DM channel.
+/// `POST /api/v1/channels/direct` - create or fetch a 1:1 DM channel.
 pub async fn create_direct(
     State(state): State<AppState>,
     user: AuthUser,
@@ -93,7 +112,8 @@ pub async fn create_direct(
     // Find an existing direct channel containing exactly these two users.
     let existing: Option<Channel> = sqlx::query_as::<_, Channel>(
         r#"
-        SELECT c.id, c.name, c.topic, c.channel_type, c.created_by, c.created_at, c.updated_at
+        SELECT c.id, c.name, c.topic, c.channel_type, c.created_by, c.created_at, c.updated_at,
+               c.archived_at, c.archived_by
         FROM channels c
         WHERE c.channel_type = 'direct'
           AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.id) = 2
@@ -116,7 +136,8 @@ pub async fn create_direct(
         r#"
         INSERT INTO channels (id, name, topic, channel_type, created_by)
         VALUES ($1, NULL, NULL, 'direct', $2)
-        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at
+        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at,
+                  archived_at, archived_by
         "#,
     )
     .bind(Uuid::new_v4())
@@ -137,7 +158,7 @@ pub async fn create_direct(
     Ok(Json(channel))
 }
 
-/// `POST /api/v1/channels/:id/read` — advance the caller's read cursor to now.
+/// `POST /api/v1/channels/:id/read` - advance the caller's read cursor to now.
 ///
 /// History loading already advances `last_read_at`, but when a channel is the
 /// active view, live messages arrive without re-fetching history. The client
@@ -188,7 +209,7 @@ pub async fn mark_read(
     Ok(super::ok())
 }
 
-/// `PATCH /api/v1/channels/:id/mute` — mute or unmute this channel for the
+/// `PATCH /api/v1/channels/:id/mute` - mute or unmute this channel for the
 /// caller. Muting suppresses all notifications from the channel (mentions,
 /// DMs, thread replies, and `@channel` broadcasts) while still tracking unread
 /// counts, so the sidebar can show quiet activity without interrupting.
@@ -208,7 +229,7 @@ pub async fn set_mute(
     Ok(Json(serde_json::json!({ "muted": req.muted })))
 }
 
-/// `GET /api/v1/channels/:id/receipts` — read cursors for every member of the
+/// `GET /api/v1/channels/:id/receipts` - read cursors for every member of the
 /// channel. The client compares each `last_read_at` against message timestamps
 /// to render "Seen" (DMs) or "Seen by N" (group channels).
 pub async fn list_receipts(
@@ -227,16 +248,18 @@ pub async fn list_receipts(
     Ok(Json(receipts))
 }
 
-/// `GET /api/v1/channels` — list channels the current user belongs to, each
-/// annotated with the caller's unread count and last-read timestamp.
+/// `GET /api/v1/channels` - list channels the current user belongs to, each
+/// annotated with the caller's unread count and last-read timestamp. Archived
+/// channels are hidden unless `?include_archived=true` is passed.
 pub async fn list_channels(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(q): Query<ListChannelsQuery>,
 ) -> AppResult<Json<Vec<crate::models::channel::ChannelWithMeta>>> {
     let channels = sqlx::query_as::<_, crate::models::channel::ChannelWithMeta>(
         r#"
         SELECT c.id, c.name, c.topic, c.channel_type, c.created_by,
-               c.created_at, c.updated_at,
+               c.created_at, c.updated_at, c.archived_at, c.archived_by,
                m.last_read_at,
                m.muted,
                (
@@ -250,10 +273,12 @@ pub async fn list_channels(
         FROM channels c
         JOIN channel_members m ON m.channel_id = c.id
         WHERE m.user_id = $1
+          AND ($2 OR c.archived_at IS NULL)
         ORDER BY c.updated_at DESC
         "#,
     )
     .bind(user.id)
+    .bind(q.include_archived)
     .fetch_all(&state.db)
     .await?;
     Ok(Json(channels))
@@ -268,7 +293,8 @@ pub async fn get_channel(
     access::require_member(&state.db, id, user.id).await?;
     let channel: Channel = sqlx::query_as::<_, Channel>(
         r#"
-        SELECT id, name, topic, channel_type, created_by, created_at, updated_at
+        SELECT id, name, topic, channel_type, created_by, created_at, updated_at,
+               archived_at, archived_by
         FROM channels WHERE id = $1
         "#,
     )
@@ -292,7 +318,8 @@ pub async fn update_channel(
         UPDATE channels
         SET name = COALESCE($2, name), topic = COALESCE($3, topic)
         WHERE id = $1
-        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at
+        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at,
+                  archived_at, archived_by
         "#,
     )
     .bind(id)
@@ -313,7 +340,8 @@ pub async fn list_members(
     let members: Vec<crate::models::user::User> = sqlx::query_as::<_, crate::models::user::User>(
         r#"
         SELECT u.id, u.email, u.username, u.display_name, u.password_hash, u.role,
-               u.avatar_url, u.is_active, u.created_at, u.updated_at
+               u.avatar_url, u.is_active, u.created_at, u.updated_at,
+               u.status_emoji, u.status_text, u.status_expires_at
         FROM users u
         JOIN channel_members m ON m.user_id = u.id
         WHERE m.channel_id = $1
@@ -354,6 +382,19 @@ pub async fn add_member(
         )
         .await;
     }
+
+    // Realtime: broadcast the new member so other members' rosters update live.
+    if res.rows_affected() > 0 {
+        if let Ok(joined) = load_public(&state, req.user_id).await {
+            state.events.emit_channel(
+                id,
+                ServerEvent::MemberJoined {
+                    channel_id: id,
+                    user: joined,
+                },
+            );
+        }
+    }
     Ok(super::ok())
 }
 
@@ -367,10 +408,207 @@ pub async fn remove_member(
     if target != user.id {
         access::require_channel_admin(&state.db, id, user.id).await?;
     }
+
+    // Last-admin guard: the final owner/admin can't leave while other members
+    // remain, which would strand the channel with no one able to administer it.
+    let target_role: Option<MemberRole> = sqlx::query_scalar(
+        "SELECT role FROM channel_members WHERE channel_id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(target)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if matches!(target_role, Some(MemberRole::Owner) | Some(MemberRole::Admin)) {
+        let other_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channel_members \
+             WHERE channel_id = $1 AND user_id <> $2 AND role IN ('owner', 'admin')",
+        )
+        .bind(id)
+        .bind(target)
+        .fetch_one(&state.db)
+        .await?;
+        let other_members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channel_members WHERE channel_id = $1 AND user_id <> $2",
+        )
+        .bind(id)
+        .bind(target)
+        .fetch_one(&state.db)
+        .await?;
+        if other_admins == 0 && other_members > 0 {
+            return Err(AppError::BadRequest(
+                "you're the last admin; promote another member before leaving".into(),
+            ));
+        }
+    }
+
     sqlx::query("DELETE FROM channel_members WHERE channel_id = $1 AND user_id = $2")
         .bind(id)
         .bind(target)
         .execute(&state.db)
         .await?;
+
+    state.events.emit_channel(
+        id,
+        ServerEvent::MemberLeft {
+            channel_id: id,
+            user_id: target,
+        },
+    );
     Ok(super::ok())
+}
+
+/// Shared helper for archive/unarchive. Rejects DMs and groups (only named
+/// public/private channels have a meaningful archived state).
+async fn set_archived(
+    state: &AppState,
+    user: &AuthUser,
+    id: Uuid,
+    archived: bool,
+) -> AppResult<Json<Channel>> {
+    access::require_channel_admin(&state.db, id, user.id).await?;
+
+    let channel_type: ChannelType =
+        sqlx::query_scalar("SELECT channel_type FROM channels WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("channel".into()))?;
+
+    if matches!(channel_type, ChannelType::Direct | ChannelType::Group) {
+        return Err(AppError::BadRequest(
+            "direct messages and groups cannot be archived".into(),
+        ));
+    }
+
+    let (archived_at, archived_by) = if archived {
+        (Some(chrono::Utc::now()), Some(user.id))
+    } else {
+        (None, None)
+    };
+
+    let channel: Channel = sqlx::query_as::<_, Channel>(
+        r#"
+        UPDATE channels
+        SET archived_at = $2, archived_by = $3
+        WHERE id = $1
+        RETURNING id, name, topic, channel_type, created_by, created_at, updated_at,
+                  archived_at, archived_by
+        "#,
+    )
+    .bind(id)
+    .bind(archived_at)
+    .bind(archived_by)
+    .fetch_one(&state.db)
+    .await?;
+
+    state.events.emit_channel(
+        id,
+        ServerEvent::ChannelArchived {
+            channel_id: id,
+            archived,
+        },
+    );
+
+    Ok(Json(channel))
+}
+
+/// `POST /api/v1/channels/:id/archive` (channel-admin only).
+pub async fn archive_channel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Channel>> {
+    set_archived(&state, &user, id, true).await
+}
+
+/// `POST /api/v1/channels/:id/unarchive` (channel-admin only).
+pub async fn unarchive_channel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Channel>> {
+    set_archived(&state, &user, id, false).await
+}
+
+/// `POST /api/v1/channels/:id/join` - self-service join for public channels.
+/// Private channels, DMs, groups, and archived channels reject the request.
+pub async fn join_channel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    let channel: Channel = sqlx::query_as::<_, Channel>(
+        r#"
+        SELECT id, name, topic, channel_type, created_by, created_at, updated_at,
+               archived_at, archived_by
+        FROM channels WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("channel".into()))?;
+
+    if channel.channel_type != ChannelType::Public {
+        return Err(AppError::Forbidden(
+            "only public channels can be joined directly".into(),
+        ));
+    }
+    if channel.archived_at.is_some() {
+        return Err(AppError::BadRequest(
+            "this channel is archived and can't be joined".into(),
+        ));
+    }
+
+    let res = sqlx::query(
+        "INSERT INTO channel_members (channel_id, user_id, role)
+         VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+
+    // Broadcast only on a genuine first join.
+    if res.rows_affected() > 0 {
+        if let Ok(joined) = load_public(&state, user.id).await {
+            state.events.emit_channel(
+                id,
+                ServerEvent::MemberJoined {
+                    channel_id: id,
+                    user: joined,
+                },
+            );
+        }
+    }
+    Ok(super::ok())
+}
+
+/// `GET /api/v1/channels/browse` - the public channel directory. Returns every
+/// non-archived public channel with its member count and whether the caller is
+/// already a member, so the client can render Join/Open affordances.
+pub async fn browse_channels(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> AppResult<Json<Vec<BrowsableChannel>>> {
+    let channels = sqlx::query_as::<_, BrowsableChannel>(
+        r#"
+        SELECT c.id, c.name, c.topic, c.channel_type, c.created_by,
+               c.created_at, c.updated_at,
+               (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.id) AS member_count,
+               EXISTS (
+                   SELECT 1 FROM channel_members m
+                   WHERE m.channel_id = c.id AND m.user_id = $1
+               ) AS is_member
+        FROM channels c
+        WHERE c.channel_type = 'public'
+          AND c.archived_at IS NULL
+        ORDER BY c.name
+        "#,
+    )
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(channels))
 }

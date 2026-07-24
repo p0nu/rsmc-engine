@@ -4,7 +4,9 @@ use axum::Json;
 
 pub mod app_links;
 pub mod auth;
+pub mod avatars;
 pub mod channels;
+pub mod compose;
 pub mod files;
 pub mod health;
 pub mod messages;

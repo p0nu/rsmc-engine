@@ -1,4 +1,4 @@
-//! Presence handlers — online/offline + last-seen lookups.
+//! Presence handlers - online/offline + last-seen lookups.
 
 use crate::error::AppResult;
 use crate::middleware::AuthUser;
@@ -47,7 +47,7 @@ pub struct BulkPresenceRequest {
     pub user_ids: Vec<Uuid>,
 }
 
-/// `POST /api/v1/presence/bulk` — resolve presence for many users at once.
+/// `POST /api/v1/presence/bulk` - resolve presence for many users at once.
 pub async fn bulk_presence(
     State(state): State<AppState>,
     _user: AuthUser,

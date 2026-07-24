@@ -3,6 +3,7 @@
 pub mod access;
 pub mod events;
 pub mod notifications;
+pub mod scheduler;
 pub mod webhooks;
 
 #[cfg(feature = "redis-pubsub")]

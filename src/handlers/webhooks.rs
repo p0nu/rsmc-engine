@@ -66,7 +66,7 @@ pub async fn create_webhook(
     }))
 }
 
-/// `GET /api/v1/webhooks` — list webhooks owned by the current user.
+/// `GET /api/v1/webhooks` - list webhooks owned by the current user.
 pub async fn list_webhooks(
     State(state): State<AppState>,
     user: AuthUser,

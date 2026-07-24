@@ -13,7 +13,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-/// `GET /api/v1/app-links` — list bookmarks (any authenticated user).
+/// `GET /api/v1/app-links` - list bookmarks (any authenticated user).
 pub async fn list_app_links(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -29,7 +29,7 @@ pub async fn list_app_links(
     Ok(Json(links))
 }
 
-/// `POST /api/v1/app-links` — add a bookmark (admin only).
+/// `POST /api/v1/app-links` - add a bookmark (admin only).
 pub async fn create_app_link(
     State(state): State<AppState>,
     AdminUser(_admin): AdminUser,
@@ -69,7 +69,7 @@ pub async fn create_app_link(
     Ok(Json(link))
 }
 
-/// `DELETE /api/v1/app-links/:id` — remove a bookmark (admin only).
+/// `DELETE /api/v1/app-links/:id` - remove a bookmark (admin only).
 pub async fn delete_app_link(
     State(state): State<AppState>,
     AdminUser(_admin): AdminUser,

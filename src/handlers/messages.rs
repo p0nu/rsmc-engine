@@ -18,7 +18,7 @@ use axum::{
 use uuid::Uuid;
 
 /// Enrich raw messages with author + attachments in a bounded number of queries.
-async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResult<Vec<MessageView>> {
+pub(crate) async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResult<Vec<MessageView>> {
     if messages.is_empty() {
         return Ok(vec![]);
     }
@@ -29,7 +29,8 @@ async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResult<Vec<Messa
     let authors: Vec<crate::models::user::User> = sqlx::query_as::<_, crate::models::user::User>(
         r#"
         SELECT id, email, username, display_name, password_hash, role,
-               avatar_url, is_active, created_at, updated_at
+               avatar_url, is_active, created_at, updated_at,
+               status_emoji, status_text, status_expires_at
         FROM users WHERE id = ANY($1)
         "#,
     )
@@ -125,6 +126,9 @@ fn placeholder_user(id: Uuid) -> UserPublic {
         avatar_url: None,
         is_active: false,
         created_at: chrono::Utc::now(),
+        status_emoji: None,
+        status_text: None,
+        status_expires_at: None,
     }
 }
 
@@ -137,6 +141,19 @@ pub async fn send_message(
 ) -> AppResult<Json<MessageView>> {
     user.require(Permission::SendMessage)?;
     access::require_member(&state.db, channel_id, user.id).await?;
+
+    // Archived channels are read-only.
+    let archived: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT archived_at FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
+    if archived.is_some() {
+        return Err(AppError::BadRequest(
+            "this channel is archived and read-only".into(),
+        ));
+    }
 
     // A message must carry something: text, attachments, or both.
     if req.content.trim().is_empty() && req.attachment_ids.is_empty() {
@@ -383,7 +400,7 @@ async fn dispatch_notifications(
     }
 }
 
-/// `GET /api/v1/channels/:id/messages` — paginated history (newest first).
+/// `GET /api/v1/channels/:id/messages` - paginated history (newest first).
 pub async fn history(
     State(state): State<AppState>,
     user: AuthUser,
@@ -451,7 +468,7 @@ pub async fn history(
     }))
 }
 
-/// `GET /api/v1/messages/:id/thread` — replies to a thread root.
+/// `GET /api/v1/messages/:id/thread` - replies to a thread root.
 pub async fn thread(
     State(state): State<AppState>,
     user: AuthUser,
@@ -527,7 +544,7 @@ pub async fn edit_message(
     Ok(Json(view))
 }
 
-/// `DELETE /api/v1/messages/:id` — soft delete.
+/// `DELETE /api/v1/messages/:id` - soft delete.
 pub async fn delete_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -570,7 +587,7 @@ async fn message_channel(state: &AppState, message_id: Uuid) -> AppResult<Uuid> 
     channel_id.ok_or_else(|| AppError::NotFound("message".into()))
 }
 
-/// `POST /api/v1/messages/:id/reactions` — add an emoji reaction.
+/// `POST /api/v1/messages/:id/reactions` - add an emoji reaction.
 pub async fn add_reaction(
     State(state): State<AppState>,
     user: AuthUser,
@@ -605,7 +622,7 @@ pub async fn add_reaction(
     Ok(super::ok())
 }
 
-/// `DELETE /api/v1/messages/:id/reactions` — remove the caller's reaction.
+/// `DELETE /api/v1/messages/:id/reactions` - remove the caller's reaction.
 pub async fn remove_reaction(
     State(state): State<AppState>,
     user: AuthUser,
@@ -636,7 +653,7 @@ pub async fn remove_reaction(
     Ok(super::ok())
 }
 
-/// `GET /api/v1/search?q=...&channel_id=...&limit=...` — full-text message
+/// `GET /api/v1/search?q=...&channel_id=...&limit=...` - full-text message
 /// search. Scoped to one channel when `channel_id` is given, otherwise across
 /// every channel the caller is a member of. Deleted messages are excluded.
 pub async fn search(
@@ -698,7 +715,7 @@ pub async fn search(
     }))
 }
 
-/// `POST /api/v1/messages/:id/pin` — pin a message in its channel.
+/// `POST /api/v1/messages/:id/pin` - pin a message in its channel.
 pub async fn pin_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -732,7 +749,7 @@ pub async fn pin_message(
     Ok(Json(view))
 }
 
-/// `DELETE /api/v1/messages/:id/pin` — unpin a message.
+/// `DELETE /api/v1/messages/:id/pin` - unpin a message.
 pub async fn unpin_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -765,7 +782,7 @@ pub async fn unpin_message(
     Ok(Json(view))
 }
 
-/// `GET /api/v1/channels/:id/pins` — list pinned messages in a channel,
+/// `GET /api/v1/channels/:id/pins` - list pinned messages in a channel,
 /// newest pin first.
 pub async fn list_pins(
     State(state): State<AppState>,

@@ -3,7 +3,7 @@
 //! A plug-and-play, production-ready backend engine for team collaboration:
 //! authentication, real-time messaging (channels, DMs, threads), message
 //! history, file sharing with access control, presence, notifications, and
-//! webhooks — built on Axum, SQLx/PostgreSQL, Tokio, and optional Redis pub/sub.
+//! webhooks - built on Axum, SQLx/PostgreSQL, Tokio, and optional Redis pub/sub.
 //!
 //! ## Embedding
 //!
@@ -49,6 +49,12 @@ pub fn build_router(state: AppState) -> Router {
             "/users/me",
             get(handlers::users::me).patch(handlers::users::update_me),
         )
+        .route("/users/me/status", put(handlers::users::set_status))
+        .route(
+            "/users/me/avatar",
+            post(handlers::avatars::upload_avatar).delete(handlers::avatars::delete_avatar),
+        )
+        .route("/users/:id/avatar", get(handlers::avatars::serve_avatar))
         .route("/users", get(handlers::users::list_users))
         .route("/users/:id", get(handlers::users::get_user))
         .route("/users/:id/role", put(handlers::users::set_role))
@@ -66,6 +72,16 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::channels::create_channel).get(handlers::channels::list_channels),
         )
         .route("/channels/direct", post(handlers::channels::create_direct))
+        .route("/channels/browse", get(handlers::channels::browse_channels))
+        .route(
+            "/channels/:id/archive",
+            post(handlers::channels::archive_channel),
+        )
+        .route(
+            "/channels/:id/unarchive",
+            post(handlers::channels::unarchive_channel),
+        )
+        .route("/channels/:id/join", post(handlers::channels::join_channel))
         .route(
             "/channels/:id/read",
             post(handlers::channels::mark_read),
@@ -102,6 +118,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/messages/:id",
             patch(handlers::messages::edit_message).delete(handlers::messages::delete_message),
+        )
+        // ---- scheduled messages + drafts ----
+        .route(
+            "/channels/:id/scheduled",
+            post(handlers::compose::create_scheduled).get(handlers::compose::list_scheduled),
+        )
+        .route(
+            "/scheduled/:id",
+            delete(handlers::compose::cancel_scheduled),
+        )
+        .route(
+            "/channels/:id/draft",
+            get(handlers::compose::get_draft).put(handlers::compose::save_draft),
         )
         .route(
             "/messages/:id/reactions",
@@ -230,5 +259,10 @@ pub async fn bootstrap(settings: config::Settings) -> anyhow::Result<AppState> {
     #[cfg(not(feature = "redis-pubsub"))]
     let events = services::events::EventBus::new(hub.clone(), pool.clone());
 
-    Ok(AppState::new(pool, settings, jwt, hub, events))
+    let state = AppState::new(pool, settings, jwt, hub, events);
+
+    // Start the background scheduler that delivers due scheduled messages.
+    services::scheduler::spawn(state.clone());
+
+    Ok(state)
 }

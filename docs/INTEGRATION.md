@@ -1,62 +1,74 @@
 # Building a Frontend for rsmc-engine
 
-*A practical, framework-agnostic guide to designing and coding your own UI on top of the **rsmc-engine** backend (Realtime Sync, Messaging & Collaboration).*
+A practical, framework-agnostic guide to designing and coding your own UI on top
+of the rsmc-engine backend (Realtime Sync, Messaging & Collaboration).
 
-rsmc-engine is a headless backend. It ships **no UI** — it exposes a REST API under `/api/v1` plus a WebSocket channel, and you bring whatever frontend you like (React, Vue, Svelte, SwiftUI, Flutter, a CLI — anything that speaks HTTP and WebSocket). This guide walks through everything you need to build a solid client: the mental model, auth, the data you'll render, realtime wiring, file handling, and the design decisions that make the difference between a demo and a real app.
-
----
+rsmc-engine is headless. It exposes a REST API under `/api/v1` plus a WebSocket
+channel, and you bring whatever frontend you like (React, Vue, Svelte, SwiftUI,
+Flutter, a CLI, anything that speaks HTTP and WebSocket). This guide covers the
+mental model, auth, the data you render, realtime wiring, files, and the design
+decisions that separate a demo from a real app.
 
 ## 1. The mental model
 
-Before any code, understand what the engine gives you and where the boundaries are.
+The engine owns identity and auth (JWT), users and roles, channels (public,
+private, direct, group), messages with threads, channel lifecycle
+(archive/browse/join), scheduled messages, drafts, custom status, file storage
+with access control, presence, notifications, and outbound webhooks. It enforces
+all permissions server-side.
 
-The engine owns: identity and auth (JWT), users and roles, channels (public, private, direct, group), messages with threads, file storage with access control, presence (who's online), notifications, and outbound webhooks. It enforces all permissions server-side.
-
-Your frontend owns: everything visual and interactive. Layout, navigation, styling, optimistic updates, local caching, how you present errors, and crucially **how you reflect the permission model to users** (more on that below).
+Your frontend owns everything visual and interactive: layout, navigation,
+styling, optimistic updates, local caching, how you present errors, and how you
+reflect the permission model to users.
 
 Two transports work together:
 
-- **REST** (`/api/v1/...`) for request/response actions: log in, list channels, send a message, upload a file, page through history.
-- **WebSocket** (`/api/v1/ws`) for realtime pushes: new messages, edits, deletes, typing indicators, presence changes, and notifications.
+- **REST** (`/api/v1/...`) for request/response actions: log in, list channels, send a message, upload a file, page history.
+- **WebSocket** (`/api/v1/ws`) for realtime pushes: new messages, edits, deletes, typing, presence, membership, status/profile changes, and notifications.
 
-The golden rule: **REST is the source of truth; WebSocket is a live notifier.** You fetch state over REST and then *keep it fresh* via WebSocket events. Events are best-effort and are **not** replayed on reconnect — so after any reconnect you re-subscribe and backfill from REST. Never treat the socket as your only data path.
-
----
+The golden rule: **REST is the source of truth; WebSocket is a live notifier.**
+Fetch state over REST, then keep it fresh via WebSocket events. Events are
+best-effort and are **not** replayed on reconnect, so after any reconnect you
+re-subscribe and backfill from REST. Never treat the socket as your only data
+path.
 
 ## 2. Prerequisites & connection basics
 
-Point your client at the engine's base URL. In development the engine typically runs on `http://localhost:8080`, so:
+In development the engine typically runs on `http://localhost:8080`:
 
 - REST base: `http://localhost:8080/api/v1`
-- WebSocket: `ws://localhost:8080/api/v1/ws` (use `wss://` in production)
+- WebSocket: `ws://localhost:8080/api/v1/ws` (`wss://` in production)
 
-All bodies are JSON unless noted (file upload is multipart; file download is binary). Timestamps are ISO-8601 UTC strings. IDs are UUID strings.
+Bodies are JSON unless noted (file/avatar upload is multipart; download is
+binary). Timestamps are ISO-8601 UTC strings. IDs are UUID strings.
 
-**CORS.** The engine sends permissive CORS by default (or an explicit allowlist you configure via `CORS_ORIGINS`). If you serve your frontend from a different origin than the API and hit CORS errors, set the allowed origins on the backend.
+**CORS.** The engine sends permissive CORS by default, or an explicit allowlist
+via `CORS_ORIGINS`. If your frontend is on a different origin and you hit CORS
+errors, set the allowed origins on the backend.
 
-**Dev proxy (recommended).** Rather than hardcoding the backend host and fighting CORS, proxy `/api` from your dev server to the engine. With Vite, for example, you forward REST and WebSocket separately — the WebSocket entry needs its own `ws: true` flag, because mixing it with the REST proxy entry breaks multipart uploads:
+**Dev proxy (recommended).** Rather than hardcoding the host and fighting CORS,
+proxy `/api` from your dev server to the engine. The WebSocket entry needs its
+own `ws: true` flag; mixing it with the REST entry breaks multipart uploads:
 
 ```js
 // vite.config.js
 export default {
   server: {
     proxy: {
-      // WebSocket: dedicated entry, ws: true
       "/api/v1/ws": { target: "ws://localhost:8080", ws: true },
-      // REST: everything else under /api
       "/api": { target: "http://localhost:8080", changeOrigin: true },
     },
   },
 };
 ```
 
-With that proxy, your client can use relative paths (`/api/v1/...`) and a relative WebSocket URL, and you never think about CORS again in dev.
+With that, use relative paths (`/api/v1/...`) and a relative WebSocket URL, and
+CORS never comes up in dev.
 
----
+## 3. Authentication
 
-## 3. Authentication — the foundation
-
-Everything except `/healthz`, `/readyz`, signup, login, and refresh requires a bearer token. Get auth right first; the rest builds on it.
+Everything except `/healthz`, `/readyz`, signup, login, refresh, and the public
+avatar serve requires a bearer token. Get auth right first.
 
 ### 3.1 The token model
 
@@ -64,34 +76,36 @@ Signup or login returns an **AuthResponse**:
 
 ```json
 {
-  "access_token": "eyJ...",
-  "refresh_token": "eyJ...",
-  "token_type": "Bearer",
-  "expires_in": 3600,
-  "user": { "id": "...", "email": "...", "username": "...",
-            "display_name": "...", "role": "admin",
-            "avatar_url": null, "is_active": true, "created_at": "..." }
+  "access_token": "eyJ...", "refresh_token": "eyJ...",
+  "token_type": "Bearer", "expires_in": 3600,
+  "user": { /* UserPublic */ }
 }
 ```
 
-- **access_token** — short-lived (default 1h). Send it on every protected request as `Authorization: Bearer <access_token>`.
-- **refresh_token** — long-lived (default 30d), **single-use / rotated**. When the access token expires, `POST /auth/refresh` with the refresh token to get a *new pair*; the old refresh token is immediately revoked.
-- The first account to sign up on a fresh database becomes `admin`.
+- **access_token**: short-lived (default 1h). Send as `Authorization: Bearer <access_token>` on every protected request.
+- **refresh_token**: long-lived (default 30d), single-use / rotated. When the access token expires, `POST /auth/refresh` for a new pair; the old refresh token is revoked immediately.
+- The first account on a fresh database becomes `admin`.
 
 ### 3.2 Storing tokens
 
-For a web app, the pragmatic choice is to keep tokens in memory and mirror them to `localStorage` so a page reload restores the session. Be aware of the standard trade-off: `localStorage` is readable by any script on your origin, so it's vulnerable to XSS. If your threat model demands it, the more secure pattern is to have your *own* tiny backend store the refresh token in an `HttpOnly` cookie and proxy auth — but for most self-hosted/internal deployments, `localStorage` with a strong CSP is the common, acceptable choice. Pick deliberately.
+For a web app, keep tokens in memory and mirror them to `localStorage` so a
+reload restores the session. The trade-off: `localStorage` is readable by any
+script on your origin, so it's XSS-exposed. If your threat model demands more,
+have your own tiny backend hold the refresh token in an `HttpOnly` cookie and
+proxy auth. For most self-hosted deployments, `localStorage` with a strong CSP is
+the common, acceptable choice. Pick deliberately.
 
-### 3.3 The auth flow you must implement
+### 3.3 The auth flow to implement
 
-1. **Boot:** if you have a stored access token, call `GET /users/me` to validate it and load the current user. If it returns `401`, try a refresh; if that also fails, clear tokens and show the login screen.
-2. **Login/Signup:** POST credentials, store the returned pair, set the current user, connect the WebSocket.
-3. **Transparent refresh:** when *any* API call returns `401`, attempt a single refresh, then retry the original request once. If the refresh fails, log the user out cleanly.
+1. **Boot:** if a stored access token exists, call `GET /users/me` to validate it and load the user. On `401`, try a refresh; if that also fails, clear tokens and show login.
+2. **Login/Signup:** POST credentials, store the pair, set the user, connect the WebSocket.
+3. **Transparent refresh:** on any `401`, attempt a single refresh, then retry the original request once. If refresh fails, log out cleanly.
 4. **Logout:** `POST /auth/logout` (revokes all your refresh tokens), then clear local state and close the socket.
 
 ### 3.4 A reference HTTP client
 
-A thin wrapper centralizes auth, refresh-on-401, timeouts, and error shaping. This is the single most important piece of client infrastructure — build it once and route everything through it.
+A thin wrapper centralizes auth, refresh-on-401, timeouts, and error shaping.
+Build it once and route everything through it.
 
 ```js
 const BASE = "/api/v1";
@@ -171,11 +185,19 @@ export const api = {
   login:  (b) => request("POST", "/auth/login",  { body: b, retry: false }),
   logout: () => request("POST", "/auth/logout"),
   // users
-  me:      () => request("GET", "/users/me"),
-  updateMe:(b) => request("PATCH", "/users/me", { body: b }),
+  me:       () => request("GET", "/users/me"),
+  updateMe: (b) => request("PATCH", "/users/me", { body: b }),
+  setStatus:(b) => request("PUT", "/users/me/status", { body: b }),
+  uploadAvatar: (fd) => request("POST", "/users/me/avatar", { raw: fd }),
+  deleteAvatar: () => request("DELETE", "/users/me/avatar"),
   searchUsers: (q, limit = 50) => request("GET", `/users?q=${encodeURIComponent(q)}&limit=${limit}`),
   // channels
-  listChannels: () => request("GET", "/channels"),
+  listChannels: (includeArchived = false) =>
+    request("GET", `/channels${includeArchived ? "?include_archived=true" : ""}`),
+  browseChannels: () => request("GET", "/channels/browse"),
+  joinChannel:  (id) => request("POST", `/channels/${id}/join`),
+  archiveChannel:   (id) => request("POST", `/channels/${id}/archive`),
+  unarchiveChannel: (id) => request("POST", `/channels/${id}/unarchive`),
   createChannel:(b) => request("POST", "/channels", { body: b }),
   openDirect:   (userId) => request("POST", "/channels/direct", { body: { user_id: userId } }),
   channelMembers:(id) => request("GET", `/channels/${id}/members`),
@@ -186,6 +208,12 @@ export const api = {
   thread: (msgId) => request("GET", `/messages/${msgId}/thread`),
   editMessage: (id, content) => request("PATCH", `/messages/${id}`, { body: { content } }),
   deleteMessage:(id) => request("DELETE", `/messages/${id}`),
+  // scheduled + drafts
+  scheduleMessage: (id, b) => request("POST", `/channels/${id}/scheduled`, { body: b }),
+  listScheduled:   (id) => request("GET", `/channels/${id}/scheduled`),
+  cancelScheduled: (id) => request("DELETE", `/scheduled/${id}`),
+  getDraft:  (id) => request("GET", `/channels/${id}/draft`),
+  saveDraft: (id, content) => request("PUT", `/channels/${id}/draft`, { body: { content } }),
   // files
   upload: (formData) => request("POST", "/files", { raw: formData }),
   // notifications & presence
@@ -195,59 +223,83 @@ export const api = {
 };
 ```
 
-The error envelope is always `{ "error": "<code>", "message": "<human text>" }`, so you can switch on `err.code` for behavior and show `err.message` to users.
-
----
+The error envelope is always `{ "error": "<code>", "message": "<human text>" }`,
+so switch on `err.code` for behavior and show `err.message` to users.
 
 ## 4. The data model you'll render
 
-Knowing the exact shapes lets you design components confidently.
+**UserPublic**: `id`, `email`, `username`, `display_name`, `role`
+(`admin`|`member`|`guest`), `avatar_url`, `is_active`, `created_at`, and status
+fields `status_emoji`, `status_text`, `status_expires_at` (nullable; an expired
+status comes back null).
 
-**UserPublic** — `id`, `email`, `username`, `display_name`, `role` (`admin`|`member`|`guest`), `avatar_url`, `is_active`, `created_at`.
+**Channel**: `id`, `name` (null for DMs), `topic`, `channel_type`
+(`public`|`private`|`direct`|`group`), `created_by`, `created_at`, `updated_at`,
+`archived_at`, `archived_by` (null unless archived). `GET /channels` items also
+carry `unread_count`, `last_read_at`, `muted`.
 
-**Channel** — `id`, `name` (null for DMs), `topic`, `channel_type` (`public`|`private`|`direct`|`group`), `created_by`, `created_at`, `updated_at`.
+**BrowsableChannel** (from `/channels/browse`): a public channel plus
+`member_count` and `is_member`.
 
-**ChannelMember** — `channel_id`, `user_id`, `role` (`owner`|`admin`|`member`), `last_read_at`, `joined_at`.
+**ChannelMember role** (from membership): `owner` | `admin` | `member`.
+`GET /channels/:id/members` returns `UserPublic[]`; the channel's creator is
+`channel.created_by`.
 
-**MessageView** — a message enriched for display: `id`, `channel_id`, `user_id`, `content`, `parent_id` (null = root, set = thread reply), `reply_count`, `edited_at`, `deleted_at`, `created_at`, plus `author` (UserPublic) and `attachments` (Attachment[]).
+**MessageView**: `id`, `channel_id`, `user_id`, `content`, `parent_id` (null =
+root, set = reply), `reply_count`, `edited_at`, `deleted_at`, `created_at`, plus
+`author` (UserPublic) and `attachments` (Attachment[]). The author and
+attachments are embedded, so a message renders with no extra lookups.
 
-**Attachment** — `id`, `uploader_id`, `channel_id` (null until bound to a message), `filename`, `content_type`, `size_bytes`, `created_at`.
+**Attachment**: `id`, `uploader_id`, `channel_id` (null until bound),
+`filename`, `content_type`, `size_bytes`, `created_at`.
 
-**Notification** — `id`, `user_id`, `kind` (`mention`|`direct_message`|`channel_invite`|`thread_reply`), `payload` (arbitrary JSON), `read_at`, `created_at`.
+**ScheduledMessage**: `id`, `channel_id`, `user_id`, `content`, `parent_id`,
+`scheduled_for`, `sent_at`, `created_at`.
 
-Because `MessageView` already embeds the author and attachments, your message component needs no extra lookups to render — name, avatar, text, and files all arrive together.
+**Draft**: `user_id`, `channel_id`, `content`, `updated_at`.
 
----
+**Notification**: `id`, `user_id`, `kind`
+(`mention`|`direct_message`|`channel_invite`|`thread_reply`), `payload` (JSON),
+`read_at`, `created_at`.
 
 ## 5. Loading and rendering the core views
 
-A typical client has three regions: a list of channels (sidebar), the active channel's message stream (main), and contextual panels (members, threads, files). Here's how to populate them.
+A typical client has three regions: a channel list (sidebar), the active
+channel's message stream (main), and contextual panels (members, threads, files,
+scheduled).
 
 ### 5.1 Channel list
 
-`GET /channels` returns only the channels the caller belongs to, most-recently-active first — render them in that order. Note there is **no public channel directory endpoint**: you can't list channels the user hasn't joined. If you want a "browse channels" feature, that's a product decision the engine doesn't directly support; you'd build discovery via invites or by having admins add members.
+`GET /channels` returns only channels the caller belongs to, most-recently-active
+first. Archived channels are hidden unless you pass `?include_archived=true`.
+Direct messages come back with `channel_type: "direct"` and a null `name`; derive
+the display name from the other member.
 
-Direct messages come back as channels with `channel_type: "direct"` and a null `name`. For those, derive the display name from the *other* member (fetch members and pick the one that isn't you).
+### 5.2 Browse & join
 
-### 5.2 Message history with pagination
+`GET /channels/browse` lists public channels with `member_count` and `is_member`,
+so you can offer a directory. For a channel where `is_member` is false, call
+`POST /channels/:id/join` (public channels only), then open it. Private channels,
+DMs, and groups are not joinable this way; those still rely on invites.
 
-`GET /channels/:id/messages?limit=50` returns **root messages only** (thread replies are excluded), **newest-first**, with a `next_cursor`:
+### 5.3 Message history with pagination
+
+`GET /channels/:id/messages?limit=50` returns root messages only (no thread
+replies), newest-first, with a `next_cursor`:
 
 ```json
 { "messages": [ /* newest first */ ], "next_cursor": "uuid-or-null" }
 ```
 
-To render a chat transcript you typically want oldest-at-top, so reverse the array for display. To load older messages (infinite scroll upward), pass the `next_cursor` back as `before`. When `next_cursor` is null, you've reached the beginning.
-
-Fetching history also advances your `last_read_at` server-side, which is how unread state stays consistent across devices.
+For a transcript you usually want oldest-at-top, so reverse for display. To page
+older, pass `next_cursor` back as `before`; a null cursor means you've reached the
+start. Fetching history also advances your `last_read_at` server-side.
 
 ```js
-// initial load
 const { messages, next_cursor } = await api.history(channelId, { limit: 50 });
 render(messages.slice().reverse());     // oldest at top
 let cursor = next_cursor;
 
-// load older when the user scrolls to the top
 async function loadOlder() {
   if (!cursor) return;                   // reached the beginning
   const page = await api.history(channelId, { limit: 50, before: cursor });
@@ -256,44 +308,51 @@ async function loadOlder() {
 }
 ```
 
-### 5.3 Threads
+### 5.4 Threads
 
-A root message with `reply_count > 0` has replies. Fetch them with `GET /messages/:id/thread` (returns replies **oldest-first**). Render threads in a side panel or modal. To post into a thread, send a normal message with `parent_id` set to the root message's id.
+A root message with `reply_count > 0` has replies. Fetch with
+`GET /messages/:id/thread` (oldest-first). To post into a thread, send a normal
+message with `parent_id` set to the root message's id.
 
-### 5.4 Members & presence
+### 5.5 Members & presence
 
-`GET /channels/:id/members` returns `ChannelMember[]` with per-member `role`. To show who's online, call `POST /presence/bulk` with the member user-ids; it returns `{ user_id, online, last_seen }` for each. Seed presence once on load, then keep it live via WebSocket `presence` events (and optionally re-poll every 60s as a safety net).
-
----
+`GET /channels/:id/members` returns `UserPublic[]`. For who's online, call
+`POST /presence/bulk` with the member ids; it returns `{ user_id, online,
+last_seen }` for each. Seed presence on load, then keep it live via WebSocket
+`presence` events (optionally re-poll every 60s as a safety net).
 
 ## 6. Realtime with WebSocket
 
-This is what makes the app feel alive. Connect after login, subscribe to channels as the user opens them, and translate incoming events into UI updates.
+Connect after login, subscribe to channels as the user opens them, and translate
+events into UI updates.
 
 ### 6.1 Connecting & authenticating
 
-Browsers can't set an `Authorization` header on a WebSocket, so the access token rides in the query string:
+Browsers can't set an `Authorization` header on a WebSocket, so the access token
+rides in the query string:
 
 ```
 wss://your-host/api/v1/ws?token=<access_token>
 ```
 
-An invalid/expired token is rejected with `401` *before* the upgrade. A user can hold multiple sessions (tabs/devices); events fan out to all of them. The user is marked **online** when their first session connects and **offline** when the last disconnects.
+An invalid/expired token is rejected with `401` before the upgrade. A user can
+hold multiple sessions; events fan out to all. Online is set when the first
+session connects, offline when the last disconnects.
 
 ### 6.2 The frames
 
 All frames are JSON with a `type` discriminator (snake_case).
 
-**Client → Server:**
+**Client to server:**
 
 | `type` | Fields | Meaning |
 |---|---|---|
 | `subscribe` | `channel_id` | Start receiving events for a channel you belong to |
 | `unsubscribe` | `channel_id` | Stop receiving events for a channel |
 | `typing` | `channel_id` | Broadcast that you're typing |
-| `ping` | — | Heartbeat; server replies `pong` |
+| `ping` | (none) | Heartbeat; server replies `pong` |
 
-**Server → Client:**
+**Server to client:**
 
 | `type` | Fields | When |
 |---|---|---|
@@ -302,15 +361,25 @@ All frames are JSON with a `type` discriminator (snake_case).
 | `message_deleted` | `channel_id`, `message_id` | Message soft-deleted |
 | `typing` | `channel_id`, `user_id` | Another member is typing |
 | `presence` | `user_id`, `online`, `last_seen` | A user came online / went offline |
+| `member_joined` | `channel_id`, `user` | Someone joined the channel |
+| `member_left` | `channel_id`, `user_id` | Someone left or was removed |
+| `channel_archived` | `channel_id`, `archived` | A channel was archived/unarchived |
+| `status_changed` | `user_id`, `emoji`, `text` | A user set or cleared their status |
+| `profile_updated` | `user_id`, `display_name`, `avatar_url` | A user changed name or avatar |
 | `notification` | `notification` | You received a notification |
-| `pong` | — | Reply to `ping` |
+| `pong` | (none) | Reply to `ping` |
 | `error` | `message` | A client frame was rejected |
 
-You must `subscribe` to a channel to receive its `message_*` and `typing` events; `presence` and `notification` always reach all your sessions.
+You must `subscribe` to a channel to receive its channel-scoped events
+(`message_*`, `typing`, `member_*`, `channel_archived`). Workspace-wide events
+(`presence`, `status_changed`, `profile_updated`) and your own `notification`s
+always reach all your sessions, so you can patch cached copies of a user wherever
+they appear (message authors, DM peers, member lists).
 
 ### 6.3 A resilient realtime client
 
-The two things people get wrong: not reconnecting, and not re-subscribing + backfilling after a reconnect. Handle both.
+The two things people get wrong: not reconnecting, and not re-subscribing +
+backfilling after a reconnect. Handle both.
 
 ```js
 class Realtime {
@@ -341,7 +410,8 @@ class Realtime {
 }
 ```
 
-On `_open`, refetch history for the active channel (events aren't replayed, so you may have missed some while disconnected). Then apply live events:
+On `_open`, refetch history for the active channel (events aren't replayed). Then
+apply live events:
 
 ```js
 const rt = new Realtime((ev) => {
@@ -352,6 +422,11 @@ const rt = new Realtime((ev) => {
     case "message_deleted":  markDeleted(ev.message_id); break;
     case "typing":           showTyping(ev.channel_id, ev.user_id); break;   // auto-expire after ~4s
     case "presence":         setPresence(ev.user_id, ev.online, ev.last_seen); break;
+    case "member_joined":    addMember(ev.channel_id, ev.user); break;
+    case "member_left":      removeMember(ev.channel_id, ev.user_id); break;
+    case "channel_archived": setArchived(ev.channel_id, ev.archived); break;
+    case "status_changed":   patchUserStatus(ev.user_id, ev.emoji, ev.text); break;
+    case "profile_updated":  patchUser(ev.user_id, ev.display_name, ev.avatar_url); break;
     case "notification":     addNotification(ev.notification); break;
     case "error":            console.warn("ws error:", ev.message); break;
   }
@@ -361,16 +436,17 @@ rt.connect(accessToken);
 
 ### 6.4 Optimistic sending (optional but recommended)
 
-When the user sends a message, you can render it immediately with a temporary id, then reconcile when either the REST response or the `message_created` event arrives. De-dupe by message id so the optimistic copy and the echoed event don't both show. Keep it simple at first — render on REST response — and add optimism once the basics work.
+Render the user's message immediately with a temporary id, then reconcile when
+either the REST response or the `message_created` event arrives. De-dupe by
+message id so the optimistic copy and the echoed event don't both show. Start
+simple (render on REST response) and add optimism once the basics work.
 
----
+## 7. Files & avatars
 
-## 7. Files & attachments
+**Message attachments** are a two-step flow, and access-controlled.
 
-Uploading is a two-step flow: upload the bytes, then reference the returned id when you send a message.
-
-1. **Upload** — `POST /files` as `multipart/form-data` with a single field named **`file`**. You get back `{ id, filename, content_type, size_bytes, url }`. The file is stored *unbound* (not yet attached to any message). Respect the size cap (default 25 MiB).
-2. **Attach** — include that id in `attachment_ids` when you `POST` the message. The file becomes bound to that channel/message.
+1. **Upload:** `POST /files` as `multipart/form-data` with a single **`file`** field. You get back `{ id, filename, content_type, size_bytes, url }`. The file is stored unbound. Respect the size cap (default 25 MiB).
+2. **Attach:** include that id in `attachment_ids` when you `POST` the message.
 
 ```js
 const fd = new FormData();
@@ -379,7 +455,9 @@ const uploaded = await api.upload(fd);
 await api.send(channelId, { content: caption, attachment_ids: [uploaded.id] });
 ```
 
-**Displaying files is the part people get wrong.** The download endpoint `GET /files/:id` requires the `Authorization` header and enforces access control (uploader, or a member of the channel the file is bound to). That means you **cannot** point an `<img src="/api/v1/files/:id">` at it directly — the browser won't send your bearer token, so it gets a `401` and shows a broken image. Instead, fetch the bytes *with* auth and turn them into an object URL:
+`GET /files/:id` requires the `Authorization` header and enforces access control,
+so you **cannot** point an `<img src>` straight at it (the browser won't send your
+token). Fetch the bytes with auth and make an object URL:
 
 ```js
 async function fileObjectUrl(fileId) {
@@ -391,32 +469,61 @@ async function fileObjectUrl(fileId) {
 }
 ```
 
-Remember to `URL.revokeObjectURL()` when the element unmounts to avoid leaking memory. Show a placeholder while loading and a graceful fallback on error.
+Call `URL.revokeObjectURL()` when the element unmounts.
 
----
+**Avatars are different: they're public.** Upload with
+`POST /users/me/avatar` (multipart `file`, image only), which sets the user's
+`avatar_url` to `/api/v1/users/:id/avatar?v=N`. That serve endpoint needs no auth,
+so you can use `avatar_url` directly in `<img src>`. The `?v=N` busts the cache
+when the avatar changes; `profile_updated` tells you to refresh cached copies.
+`DELETE /users/me/avatar` removes it.
 
-## 8. Notifications & presence
+## 8. Status, scheduled messages & drafts
 
-**Notifications.** On load, call `GET /notifications/unread_count` for a badge and `GET /notifications` for the list. New ones arrive live as `notification` WebSocket events — increment the badge and prepend to the list. Mark items read with `POST /notifications/:id/read` (or `read_all`). The `kind` field (`mention`, `direct_message`, `channel_invite`, `thread_reply`) lets you route the user to the right place on click; `payload` carries kind-specific context.
+**Custom status.** `PUT /users/me/status` with `{ emoji, text, expires_in_secs }`
+sets it; an empty body clears it. Other clients learn of the change via
+`status_changed`; render the emoji/text next to the user's name. An expired
+status reads back as null, so trust the server's value.
 
-**Presence.** Seed with `POST /presence/bulk` for the users you're showing, then keep live via `presence` events. A reasonable belt-and-suspenders approach is to also re-poll presence for visible users every ~60s, since events only fire on *change*.
+**Scheduled messages.** `POST /channels/:id/scheduled` with `content` and a future
+`scheduled_for` queues a send; `GET .../scheduled` lists your pending ones;
+`DELETE /scheduled/:id` cancels. When a scheduled message is delivered it arrives
+as a normal `message_created` event, so no special handling is needed to display
+it. A side panel listing pending items with a cancel button is a natural fit.
 
----
+**Drafts.** `GET /channels/:id/draft` returns your saved draft (or
+`{ content: "" }`); `PUT /channels/:id/draft` saves it, and a blank body deletes
+it. Debounce saves as the user types, restore on channel change, and clear on
+send.
 
-## 9. Respecting the permission model (the part that defines quality)
+## 9. Notifications & presence
 
-The engine enforces permissions server-side, so a forbidden action simply returns `403`. But a good UI doesn't let users walk into walls — **it reflects permissions in the interface** by disabling or hiding actions the user can't perform, and explaining why.
+**Notifications.** On load, `GET /notifications/unread_count` for a badge and
+`GET /notifications` for the list. New ones arrive live as `notification` events;
+increment the badge and prepend. Mark read with `POST /notifications/:id/read`
+(or `read_all`). The `kind` routes the user on click; `payload` carries
+kind-specific context.
+
+**Presence.** Seed with `POST /presence/bulk`, then keep live via `presence`
+events. Optionally re-poll visible users every ~60s, since events fire only on
+change.
+
+## 10. Respecting the permission model
+
+The engine enforces permissions server-side, so a forbidden action returns `403`.
+A good UI doesn't let users walk into walls: reflect permissions by disabling or
+hiding actions the user can't perform, and explaining why.
 
 The rules to mirror:
 
-- **System roles:** `admin` can do everything (including manage users and roles); `member` can create channels, send messages, upload files, read; `guest` can send and read but **cannot create channels or upload files**.
-- **Channel roles:** only a channel's `owner` (its creator) or a channel `admin` can edit the channel, add/remove members, or create channel-scoped webhooks.
-- **Self-guards:** an admin can't deactivate themselves or change their own role (the backend returns `400`); reflect that by disabling those controls on your own row.
+- **System roles:** `admin` can do everything (including manage users/roles); `member` can create channels, send messages, upload files, read; `guest` can send and read but **cannot** create channels or upload files.
+- **Channel roles:** only a channel's `owner` (creator) or a channel `admin` can edit the channel, add/remove members, archive/unarchive, or create channel-scoped webhooks.
+- **Last-admin guard:** the final owner/admin can't leave a channel while other members remain (the backend returns `400`); disable "leave" in that state.
+- **Self-guards:** an admin can't deactivate themselves or change their own role (`400` / `400`); disable those controls on your own row.
+- **Archived channels are read-only:** posting, scheduling, and joining are rejected; disable the composer and show why.
 - **Messages:** the author can edit/delete their own; channel owner/admin can also delete others'.
 
-Concretely: if `user.role === "guest"`, disable the "New channel" button and the file-upload control, with a tooltip like "Guests can't create channels." If the user isn't a channel owner/admin, hide the channel-settings gear and the add/remove-member controls. Disabling-with-explanation beats letting an action fail with a raw `403`.
-
-A small permissions helper keeps this honest and centralized:
+A small helper keeps this centralized:
 
 ```js
 const can = {
@@ -424,79 +531,75 @@ const can = {
   uploadFiles:   (u) => u.role === "admin" || u.role === "member",
   manageUsers:   (u) => u.role === "admin",
   adminChannel:  (u, ch) => u.role === "admin" || ch.created_by === u.id,
+  post:          (u, ch) => !ch.archived_at,
   editMessage:   (u, m) => m.user_id === u.id,
   deleteMessage: (u, m, ch) => m.user_id === u.id || u.role === "admin" || ch.created_by === u.id,
 };
 ```
 
-Note the engine returns channel membership with a per-member `role`, but the channel's *creator* is identified by `channel.created_by` — treat the creator as always an owner/member even before the member list loads, so the creator never sees a misleading "join this channel" prompt.
+Members come back as `UserPublic[]` without a per-member channel role, but the
+creator is `channel.created_by`. Treat the creator as an owner/member even before
+the member list loads, so they never see a misleading "join this channel" prompt.
 
----
+## 11. Error handling & resilience
 
-## 10. Error handling & resilience
+- **Always time out requests.** A hung backend should surface a clear "couldn't reach the server," never an infinite spinner (the reference client aborts after 20s, 120s for uploads).
+- **Refresh exactly once per 401**, then retry once. De-dupe concurrent refreshes so ten parallel calls don't fire ten refreshes.
+- **Boot must always resolve.** If the startup `GET /users/me` fails, fall through to login rather than hanging; keep tokens for a later retry.
+- **Map status codes to UX:** `401` re-auth; `403` "no permission" (ideally already disabled); `404` gone; `409` conflict (duplicate email/username, taken channel name, surface inline); `413` file too large; `429` back off; `500` generic retry.
+- **WebSocket reconnect with capped exponential backoff**, then re-subscribe and backfill.
+- **Surface the server's `message`** where it helps, instead of a generic string.
 
-A few habits separate a robust client from a flaky one:
+## 12. Suggested build order
 
-- **Always time out requests.** A hung backend should surface a clear "couldn't reach the server" state, never an infinite spinner. (The reference client above aborts after 20s, or 120s for uploads.)
-- **Refresh exactly once per 401**, then retry the original request once. De-dupe concurrent refreshes (the `refreshing` promise above) so ten parallel calls don't fire ten refreshes.
-- **Boot must always resolve.** If the startup `GET /users/me` fails for any reason, fall through to the login screen rather than hanging. Keep the stored tokens so a later retry can succeed.
-- **Map status codes to UX:** `401` → re-auth; `403` → "you don't have permission" (and ideally you'd have disabled the control already); `404` → gone/not found; `409` → conflict (duplicate email/username, or channel name taken — surface inline on the form); `413` → file too large; `429` → back off and retry; `500` → generic "something went wrong, try again."
-- **WebSocket reconnect with capped exponential backoff**, then re-subscribe and backfill. Never assume the socket stayed up.
-- **Surface the server's `message`.** The error envelope gives you human-readable text — show it instead of a generic string where it helps.
+Each step leaves you something working:
 
----
+1. **Auth shell:** signup/login, the HTTP client with refresh-on-401, boot via `GET /users/me`, logout.
+2. **Channel list + read-only history:** `GET /channels`, click one, render the transcript.
+3. **Sending:** the composer, `POST` messages, render on response.
+4. **Realtime:** connect the WebSocket, subscribe on open, apply `message_*` events.
+5. **Threads, members, presence:** side panels, `presence/bulk` + live presence, typing.
+6. **Files & avatars:** attachment upload + object-URL display; avatar upload (public serve).
+7. **Lifecycle:** archive/unarchive, browse + join, live `member_*` / `channel_archived`.
+8. **Status, scheduled, drafts:** the profile status editor, schedule popover + panel, per-channel drafts.
+9. **Notifications:** badge, list, live events, mark-read.
+10. **Permissions polish:** disable/hide per role, self-guards, archived read-only, friendly explanations.
+11. **Admin** (optional): user list, role changes, deactivate/reactivate, backup/restore.
 
-## 11. Suggested build order
+## 13. Framework notes
 
-You don't have to build everything at once. A sequence that always leaves you with something working:
+- **React/Vue/Svelte:** put the HTTP client and a realtime singleton at the app root; expose the current user, channels, and active channel via context/store. Drive re-renders from a normalized message store keyed by id (edits/deletes/de-dup become trivial). The same store makes `profile_updated` / `status_changed` patches a one-liner.
+- **Mobile (Swift/Kotlin/Flutter):** the same REST + WebSocket contract applies with native clients. The browser-only object-URL caveat for attachments doesn't apply; fetch bytes with the auth header and render directly.
+- **Sandboxed preview environments:** avoid browser storage there; use in-memory state and real `localStorage` in your actual app.
 
-1. **Auth shell** — signup/login forms, the HTTP client with refresh-on-401, boot via `GET /users/me`, logout. You now have a session.
-2. **Channel list + read-only history** — `GET /channels`, click one, `GET /channels/:id/messages`, render the transcript. The app is now a read-only viewer.
-3. **Sending** — the composer, `POST` messages, render on response. It's now a basic chat.
-4. **Realtime** — connect the WebSocket, subscribe on channel open, apply `message_*` events. Messages now appear live across clients.
-5. **Threads, members, presence** — side panels, `presence/bulk` + live presence, typing indicators.
-6. **Files** — upload, attach, and the auth'd object-URL display.
-7. **Notifications** — badge, list, live events, mark-read.
-8. **Permissions polish** — disable/hide actions per role, self-guards, friendly explanations.
-9. **Admin** (if you want it) — user list, role changes, deactivate/reactivate, and the system backup/restore screens.
-
-Each step is independently demoable, which keeps momentum and makes bugs easy to localize.
-
----
-
-## 12. Framework notes
-
-The guide is framework-agnostic; the patterns map cleanly:
-
-- **React/Vue/Svelte:** put the HTTP client and a realtime singleton at the app root; expose the current user, channels, and the active channel via context/store. Drive re-renders from a normalized message store keyed by id (makes edits/deletes and de-duping trivial).
-- **Mobile (Swift/Kotlin/Flutter):** the same REST + WebSocket contract applies. Use the platform's native HTTP and WebSocket clients; the only browser-specific caveat (object URLs for images) doesn't apply — you can fetch file bytes with the auth header and render directly.
-- **Avoid browser storage inside sandboxed preview environments** if you're prototyping in one; use in-memory state there and real `localStorage` in your actual app.
-
----
-
-## 13. Quick reference — endpoints
+## 14. Quick reference: endpoints
 
 ```
-Auth     POST   /auth/signup | /auth/login | /auth/refresh | /auth/logout
-Users    GET    /users/me  PATCH /users/me  GET /users/:id  GET /users?q=&limit=
-         PUT    /users/:id/role (admin)  POST /users/:id/deactivate|activate (admin)
-Channels POST   /channels  GET /channels  POST /channels/direct
-         GET    /channels/:id  PATCH /channels/:id
-         GET    /channels/:id/members  POST /channels/:id/members  DELETE /channels/:id/members/:uid
-Messages POST   /channels/:id/messages  GET /channels/:id/messages?limit=&before=&after=
-         GET    /messages/:id/thread  PATCH /messages/:id  DELETE /messages/:id
-Files    POST   /files (multipart field "file")  GET /files/:id
-Notifs   GET    /notifications?unread_only=&limit=  GET /notifications/unread_count
-         POST   /notifications/:id/read  POST /notifications/read_all
-Presence GET    /presence/:user_id  POST /presence/bulk
-Webhooks POST   /webhooks  GET /webhooks  DELETE /webhooks/:id
-System   GET    /system/info  POST /system/backup  GET /system/backups  POST /system/restore   (admin)
-Health   GET    /healthz  /readyz
-Realtime GET    /api/v1/ws?token=<access_token>     (WebSocket)
+Auth      POST   /auth/signup | /auth/login | /auth/refresh | /auth/logout
+Users     GET    /users/me  PATCH /users/me  GET /users/:id  GET /users?q=&limit=
+          PUT    /users/me/status
+          POST   /users/me/avatar   DELETE /users/me/avatar   GET /users/:id/avatar (public)
+          PUT    /users/:id/role (admin)  POST /users/:id/deactivate|activate (admin)
+Channels  POST   /channels   GET /channels?include_archived=   POST /channels/direct
+          GET    /channels/browse   POST /channels/:id/join
+          POST   /channels/:id/archive | /channels/:id/unarchive
+          GET    /channels/:id   PATCH /channels/:id   POST /channels/:id/read
+          PATCH  /channels/:id/mute
+          GET    /channels/:id/members  POST /channels/:id/members  DELETE /channels/:id/members/:uid
+Messages  POST   /channels/:id/messages  GET /channels/:id/messages?limit=&before=&after=
+          GET    /messages/:id/thread  PATCH /messages/:id  DELETE /messages/:id
+Scheduled POST   /channels/:id/scheduled  GET /channels/:id/scheduled  DELETE /scheduled/:id
+Drafts    GET    /channels/:id/draft  PUT /channels/:id/draft
+Files     POST   /files (multipart field "file")  GET /files/:id
+Notifs    GET    /notifications?unread_only=&limit=  GET /notifications/unread_count
+          POST   /notifications/:id/read  POST /notifications/read_all
+Presence  GET    /presence/:user_id  POST /presence/bulk
+Webhooks  POST   /webhooks  GET /webhooks  DELETE /webhooks/:id
+System    GET    /system/info | /system/stats   POST /system/backup | /system/restore   GET /system/backups   (admin)
+Health    GET    /healthz  /readyz
+Realtime  GET    /api/v1/ws?token=<access_token>     (WebSocket)
 ```
 
-Base URL for all REST: `/api/v1`. Auth header: `Authorization: Bearer <access_token>`. For the full request/response shapes see the engine's `docs/API.md`; for the realtime protocol see `docs/WEBSOCKET.md`.
-
----
-
-*That's everything you need to build a first-class client on rsmc-engine. Start with the auth shell, get a read-only message view working, layer in realtime, and polish permissions last. The engine handles correctness and security; your job is to make it feel great.*
+Base URL for all REST: `/api/v1`. Auth header:
+`Authorization: Bearer <access_token>`. For full request/response shapes see
+`docs/API.md`; for the realtime protocol see `docs/WEBSOCKET.md`.

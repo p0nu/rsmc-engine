@@ -73,10 +73,35 @@ pub struct User {
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Custom status: an optional emoji + short text, with an optional expiry.
+    /// `#[sqlx(default)]` keeps queries that omit these columns working.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub status_emoji: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub status_text: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub status_expires_at: Option<DateTime<Utc>>,
 }
 
 impl User {
     pub fn to_public(&self) -> UserPublic {
+        // Treat an expired status as absent so clients never render a stale one.
+        let expired = self
+            .status_expires_at
+            .map(|exp| exp <= Utc::now())
+            .unwrap_or(false);
+        let (status_emoji, status_text, status_expires_at) = if expired {
+            (None, None, None)
+        } else {
+            (
+                self.status_emoji.clone(),
+                self.status_text.clone(),
+                self.status_expires_at,
+            )
+        };
         UserPublic {
             id: self.id,
             email: self.email.clone(),
@@ -86,6 +111,9 @@ impl User {
             avatar_url: self.avatar_url.clone(),
             is_active: self.is_active,
             created_at: self.created_at,
+            status_emoji,
+            status_text,
+            status_expires_at,
         }
     }
 }
@@ -101,6 +129,12 @@ pub struct UserPublic {
     pub avatar_url: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub status_emoji: Option<String>,
+    #[serde(default)]
+    pub status_text: Option<String>,
+    #[serde(default)]
+    pub status_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -143,4 +177,17 @@ pub struct UpdateUserRequest {
     #[validate(length(min = 1, max = 64))]
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+/// Body for `PUT /users/me/status`. All fields optional: sending an empty body
+/// (or all-null) clears the status. `expires_in_secs`, when present, sets an
+/// auto-expiry that many seconds from now.
+#[derive(Debug, Deserialize, Validate)]
+pub struct SetStatusRequest {
+    #[validate(length(max = 32))]
+    pub emoji: Option<String>,
+    #[validate(length(max = 100))]
+    pub text: Option<String>,
+    /// Optional auto-expiry, in seconds from now (e.g. 3600 = clear in an hour).
+    pub expires_in_secs: Option<i64>,
 }

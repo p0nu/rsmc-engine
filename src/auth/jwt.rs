@@ -22,7 +22,7 @@ pub struct Claims {
     pub sub: Uuid,
     pub role: UserRole,
     pub tok: TokenKind,
-    /// Unique token id (jti) — used to revoke refresh tokens.
+    /// Unique token id (jti) - used to revoke refresh tokens.
     pub jti: Uuid,
     pub exp: i64,
     pub iat: i64,

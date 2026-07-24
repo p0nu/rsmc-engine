@@ -59,7 +59,7 @@ services:
       # service so they can never drift apart.
       DATABASE_URL: postgres://${POSTGRES_USER:-rsmc}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-rsmc}
       REDIS_URL: redis://redis:6379
-      # REQUIRED: no default on purpose — set a long random value in .env
+      # REQUIRED: no default on purpose - set a long random value in .env
       # (e.g. `openssl rand -hex 32`). Compose aborts if it is unset.
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (e.g. openssl rand -hex 32)}
       PORT: "8080"
@@ -74,7 +74,7 @@ services:
       # Host directories for persistent data, set once in .env. Defaults put
       # them in browsable folders next to this file. The container writes as
       # UID 10001, so the chosen host dirs must be writable by that UID
-      # (see README — a one-time `chown 10001:10001` or `chmod 777`).
+      # (see README - a one-time `chown 10001:10001` or `chmod 777`).
       - ${UPLOAD_HOST_DIR:-./uploads}:/app/uploads
       - ${BACKUP_HOST_DIR:-./backups}:/app/backups
 

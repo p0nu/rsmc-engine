@@ -534,7 +534,7 @@ async fn thread_reply_count_increments_once_per_reply() {
     .await;
     assert_eq!(replies.as_array().unwrap().len(), 1, "exactly one reply stored");
 
-    // A second reply makes it 2 — proving linear, once-per-reply counting.
+    // A second reply makes it 2 - proving linear, once-per-reply counting.
     send(
         &app,
         "POST",
@@ -1168,4 +1168,588 @@ async fn system_stats_reports_workspace_and_is_admin_only() {
     assert!(stats["server"]["version"].is_string());
     assert!(stats["database"]["size_bytes"].as_i64().unwrap() > 0);
     assert!(stats["realtime"]["online_users"].is_number());
+}
+
+// ===========================================================================
+// 0.7.0 feature tests
+// ===========================================================================
+
+/// Register a user and return (token, user_id).
+async fn signup(app: &axum::Router, email: &str, username: &str) -> (String, String) {
+    let (status, body) = send(
+        app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": email,
+            "username": username,
+            "display_name": username,
+            "password": "supersecret"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "signup failed: {body}");
+    (
+        body["access_token"].as_str().unwrap().to_string(),
+        body["user"]["id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Create a channel and return its id.
+async fn make_channel(app: &axum::Router, token: &str, name: &str, private: bool) -> String {
+    let (status, ch) = send(
+        app,
+        "POST",
+        "/api/v1/channels",
+        Some(token),
+        Some(json!({ "name": name, "private": private })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create channel failed: {ch}");
+    ch["id"].as_str().unwrap().to_string()
+}
+
+// ---- Feature 1: channel archival -----------------------------------------
+
+#[tokio::test]
+async fn archive_makes_channel_readonly_and_hides_it() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (token, _uid) = signup(&app, "arch@example.com", "archer").await;
+    let cid = make_channel(&app, &token, "archive-me", false).await;
+
+    // Archive it (owner is channel-admin).
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/archive"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "archive failed: {body}");
+    assert!(body["archived_at"].is_string(), "archived_at should be set");
+
+    // Posting is rejected.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/messages"),
+        Some(&token),
+        Some(json!({ "content": "should fail" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "posting to archived channel must fail");
+
+    // Hidden from default list, present with ?include_archived=true.
+    let (_, list) = send(&app, "GET", "/api/v1/channels", Some(&token), None).await;
+    let has = list.as_array().unwrap().iter().any(|c| c["id"] == json!(cid));
+    assert!(!has, "archived channel should be hidden by default");
+
+    let (_, list2) = send(
+        &app,
+        "GET",
+        "/api/v1/channels?include_archived=true",
+        Some(&token),
+        None,
+    )
+    .await;
+    let has2 = list2.as_array().unwrap().iter().any(|c| c["id"] == json!(cid));
+    assert!(has2, "archived channel should appear with include_archived=true");
+
+    // Unarchive restores posting.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/unarchive"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["archived_at"].is_null(), "archived_at should be cleared");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/messages"),
+        Some(&token),
+        Some(json!({ "content": "now works" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "posting after unarchive should work");
+}
+
+// ---- Feature 2: self-service join + browse --------------------------------
+
+#[tokio::test]
+async fn browse_and_join_public_channel() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (owner, _o) = signup(&app, "owner2@example.com", "owner2").await;
+    let (joiner, joiner_id) = signup(&app, "joiner@example.com", "joiner").await;
+
+    let public_id = make_channel(&app, &owner, "public-room", false).await;
+    let private_id = make_channel(&app, &owner, "private-room", true).await;
+
+    // Browse: the public channel is listed, not-yet-member for the joiner.
+    let (status, dir) = send(&app, "GET", "/api/v1/channels/browse", Some(&joiner), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = dir.as_array().unwrap();
+    let pub_row = rows.iter().find(|c| c["id"] == json!(public_id)).expect("public listed");
+    assert_eq!(pub_row["is_member"], json!(false));
+    assert!(rows.iter().all(|c| c["id"] != json!(private_id)), "private channel must not be browsable");
+
+    // Join the public channel.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{public_id}/join"),
+        Some(&joiner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "join should succeed");
+
+    // Now a member: can post, and browse shows is_member=true.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{public_id}/messages"),
+        Some(&joiner),
+        Some(json!({ "content": "hi from joiner" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member should be able to post");
+
+    let (_, dir2) = send(&app, "GET", "/api/v1/channels/browse", Some(&joiner), None).await;
+    let pub_row2 = dir2.as_array().unwrap().iter().find(|c| c["id"] == json!(public_id)).unwrap().clone();
+    assert_eq!(pub_row2["is_member"], json!(true));
+    assert_eq!(pub_row2["member_count"], json!(2));
+
+    // Joining a private channel is forbidden.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{private_id}/join"),
+        Some(&joiner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "joining private channel must be forbidden");
+
+    let _ = joiner_id;
+}
+
+// ---- Feature 3: last-admin guard ------------------------------------------
+
+#[tokio::test]
+async fn last_admin_cannot_leave_with_members_remaining() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (owner, owner_id) = signup(&app, "owner3@example.com", "owner3").await;
+    let (member, member_id) = signup(&app, "member3@example.com", "member3").await;
+
+    let cid = make_channel(&app, &owner, "guarded", false).await;
+
+    // Owner adds the member.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/members"),
+        Some(&owner),
+        Some(json!({ "user_id": member_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Owner (sole admin) can't leave while the member remains.
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/channels/{cid}/members/{owner_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "last admin should be blocked: {body}");
+
+    // The ordinary member can leave freely.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/channels/{cid}/members/{member_id}"),
+        Some(&member),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member should be able to leave");
+
+    // Now the owner is alone and can leave.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/channels/{cid}/members/{owner_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "sole remaining admin can leave when alone");
+}
+
+// ---- Feature 4: custom status ---------------------------------------------
+
+#[tokio::test]
+async fn set_and_clear_custom_status() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state.clone());
+
+    let (token, uid) = signup(&app, "status@example.com", "statususer").await;
+
+    // Set a status.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        "/api/v1/users/me/status",
+        Some(&token),
+        Some(json!({ "emoji": "🌴", "text": "on vacation" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set status failed: {body}");
+    assert_eq!(body["status_emoji"], json!("🌴"));
+    assert_eq!(body["status_text"], json!("on vacation"));
+
+    // /users/me reflects it.
+    let (_, me) = send(&app, "GET", "/api/v1/users/me", Some(&token), None).await;
+    assert_eq!(me["status_text"], json!("on vacation"));
+
+    // A status whose expiry is in the past reads as absent. Force an expired
+    // timestamp directly (the API only accepts future expiries), then confirm
+    // the public projection hides it.
+    let user_uuid = uuid::Uuid::parse_str(uid.as_str()).unwrap();
+    sqlx::query("UPDATE users SET status_expires_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(user_uuid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_, me2) = send(&app, "GET", "/api/v1/users/me", Some(&token), None).await;
+    assert!(me2["status_text"].is_null(), "expired status should read as absent");
+    assert!(me2["status_emoji"].is_null(), "expired status emoji should read as absent");
+
+    // Clear via empty body.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        "/api/v1/users/me/status",
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["status_emoji"].is_null());
+    assert!(body["status_text"].is_null());
+
+    // A valid future expiry is accepted and stored.
+    let (status, body) = send(
+        &app,
+        "PUT",
+        "/api/v1/users/me/status",
+        Some(&token),
+        Some(json!({ "emoji": "🔜", "text": "back in an hour", "expires_in_secs": 3600 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status_text"], json!("back in an hour"));
+    assert!(body["status_expires_at"].is_string(), "future expiry should be stored");
+}
+
+// ---- Feature 5: scheduled messages ----------------------------------------
+
+#[tokio::test]
+async fn schedule_list_cancel_and_deliver() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state.clone());
+
+    let (token, _uid) = signup(&app, "sched@example.com", "scheduler").await;
+    let cid = make_channel(&app, &token, "sched-room", false).await;
+
+    // A far-future schedule to cancel.
+    let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+    let (status, s1) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/scheduled"),
+        Some(&token),
+        Some(json!({ "content": "later message", "scheduled_for": future })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "schedule failed: {s1}");
+    let sched_id = s1["id"].as_str().unwrap().to_string();
+
+    // Past scheduled_for is rejected.
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/scheduled"),
+        Some(&token),
+        Some(json!({ "content": "too late", "scheduled_for": past })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "past schedule must be rejected");
+
+    // List shows the pending one.
+    let (status, listing) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/scheduled"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listing.as_array().unwrap().len(), 1);
+
+    // Cancel it.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/scheduled/{sched_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel failed");
+
+    let (_, listing2) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/scheduled"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(listing2.as_array().unwrap().len(), 0, "cancelled schedule should be gone");
+
+    // Insert a due schedule by writing directly, then sweep and verify delivery.
+    // We schedule ~1s in the past through a second row via the API is not
+    // possible (future-only), so use the public sweep with a row we insert via
+    // the pool directly.
+    let due = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let user_uuid = uuid::Uuid::parse_str(_uid.as_str()).unwrap();
+    let chan_uuid = uuid::Uuid::parse_str(cid.as_str()).unwrap();
+    sqlx::query(
+        "INSERT INTO scheduled_messages (id, channel_id, user_id, content, scheduled_for) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(chan_uuid)
+    .bind(user_uuid)
+    .bind("delivered by sweeper")
+    .bind(due)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let delivered = rsmc_engine::services::scheduler::sweep_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(delivered, 1, "sweeper should deliver exactly one message");
+
+    // The delivered message now appears in history.
+    let (_, history) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/messages"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let found = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["content"] == json!("delivered by sweeper"));
+    assert!(found, "swept message should appear in history");
+
+    // A second sweep with nothing due delivers zero.
+    let again = rsmc_engine::services::scheduler::sweep_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(again, 0, "idempotent: no double delivery");
+}
+
+// ---- Feature 6: drafts ----------------------------------------------------
+
+#[tokio::test]
+async fn draft_save_restore_and_clear() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (token, _uid) = signup(&app, "draft@example.com", "drafter").await;
+    let cid = make_channel(&app, &token, "draft-room", false).await;
+
+    // No draft yet → empty content.
+    let (status, d0) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/draft"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(d0["content"], json!(""));
+
+    // Save a draft.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/channels/{cid}/draft"),
+        Some(&token),
+        Some(json!({ "content": "half-written thought" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Restore it.
+    let (_, d1) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/draft"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(d1["content"], json!("half-written thought"));
+
+    // Empty body clears it.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/channels/{cid}/draft"),
+        Some(&token),
+        Some(json!({ "content": "   " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, d2) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{cid}/draft"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(d2["content"], json!(""), "cleared draft reads empty");
+}
+
+// ---- Feature 8: uploaded avatars ------------------------------------------
+
+#[tokio::test]
+async fn avatar_upload_serve_and_delete() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (token, uid) = signup(&app, "avatar@example.com", "avataruser").await;
+
+    // Multipart upload of a tiny PNG.
+    let boundary = "----rsmctestboundary";
+    let png: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG signature
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+    body.extend_from_slice(png);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/users/me/avatar")
+        .header("authorization", format!("Bearer {token}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "avatar upload should succeed");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let public: Value = serde_json::from_slice(&bytes).unwrap();
+    let avatar_url = public["avatar_url"].as_str().unwrap();
+    assert!(
+        avatar_url.contains(&format!("/api/v1/users/{uid}/avatar")),
+        "avatar_url should point at serve endpoint, got {avatar_url}"
+    );
+
+    // Public serve (no auth) returns the bytes.
+    let (status, _) = {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/users/{uid}/avatar"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let s = resp.status();
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        (s, b)
+    };
+    assert_eq!(status, StatusCode::OK, "public avatar serve should work without auth");
+
+    // Delete clears it.
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        "/api/v1/users/me/avatar",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["avatar_url"].is_null(), "avatar_url cleared after delete");
+
+    // Serve now 404s.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/users/{uid}/avatar"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted avatar should 404");
 }

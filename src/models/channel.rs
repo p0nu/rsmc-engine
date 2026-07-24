@@ -31,6 +31,14 @@ pub struct Channel {
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When set, the channel is archived and read-only. `#[sqlx(default)]` keeps
+    /// the existing column-list queries that don't select it working unchanged.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub archived_by: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -94,6 +102,29 @@ pub struct ChannelWithMeta {
 #[derive(Debug, Deserialize)]
 pub struct MuteRequest {
     pub muted: bool,
+}
+
+/// Query string for `GET /channels`. Archived channels are hidden by default;
+/// pass `?include_archived=true` to include them.
+#[derive(Debug, Deserialize)]
+pub struct ListChannelsQuery {
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// A public channel as shown in the browse/join directory, annotated with its
+/// member count and whether the caller is already a member.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct BrowsableChannel {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub channel_type: ChannelType,
+    pub created_by: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub member_count: i64,
+    pub is_member: bool,
 }
 
 /// One member's read cursor, used to render read receipts on the client.

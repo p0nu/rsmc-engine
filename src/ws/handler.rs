@@ -171,13 +171,12 @@ async fn mark_presence(state: &AppState, user_id: Uuid, online: bool) {
     .execute(&state.db)
     .await;
 
-    // Broadcast to the user's own sessions and peers via the event bus.
-    state.events.emit_user(
+    // Broadcast presence to every connected session (not just the user's own).
+    // Using emit_user here was the core presence bug: peers never saw the dot
+    // change because the event only reached the user's own sessions.
+    state.events.emit_all(ServerEvent::Presence {
         user_id,
-        ServerEvent::Presence {
-            user_id,
-            online,
-            last_seen: now,
-        },
-    );
+        online,
+        last_seen: now,
+    });
 }

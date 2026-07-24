@@ -1,16 +1,15 @@
 # Running without Docker
 
-A complete, tested setup using only **Rust** and **PostgreSQL** — no Docker, no
-Redis required.
+A tested setup using only Rust and PostgreSQL. Redis is optional.
 
 > **Redis is optional.** The engine compiles with Redis support by default, but
-> if `REDIS_URL` is not set it runs in single-instance mode using in-process
-> event dispatch. You only need Redis to fan out realtime events across multiple
-> engine instances behind a load balancer. For a single instance, skip it.
+> if `REDIS_URL` is unset it runs single-instance using in-process event
+> dispatch. You only need Redis to fan out events across multiple instances
+> behind a load balancer.
 
 ## 1. Install prerequisites
 
-**Rust** (stable toolchain, 1.85+ recommended):
+**Rust** (stable, 1.85+ recommended):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -18,7 +17,7 @@ source "$HOME/.cargo/env"
 rustc --version
 ```
 
-**PostgreSQL** (16 recommended, to match the backup tooling — see
+**PostgreSQL** (16 recommended, to match the backup tooling; see
 [CONFIGURATION.md](CONFIGURATION.md)):
 
 ```bash
@@ -32,11 +31,7 @@ brew install postgresql@16 && brew services start postgresql@16
 sudo dnf install -y postgresql-server postgresql && sudo postgresql-setup --initdb && sudo systemctl enable --now postgresql
 ```
 
-Confirm the server is running:
-
-```bash
-pg_isready          # should report "accepting connections"
-```
+Confirm it's running: `pg_isready` should report "accepting connections".
 
 ## 2. Create the database and role
 
@@ -50,18 +45,13 @@ CREATE DATABASE rsmc OWNER rsmc;
 SQL
 ```
 
-> Use a strong password beyond local development, and update `DATABASE_URL`
-> accordingly.
+> Use a strong password beyond local development and update `DATABASE_URL` to
+> match.
 
-Verify the connection:
-
-```bash
-PGPASSWORD=rsmc psql -h localhost -U rsmc -d rsmc -c '\conninfo'
-```
-
-If this fails with a peer-authentication error on Linux, ensure `pg_hba.conf`
-allows password (`md5`/`scram-sha-256`) auth for TCP connections from
-`127.0.0.1`, then reload PostgreSQL.
+Verify: `PGPASSWORD=rsmc psql -h localhost -U rsmc -d rsmc -c '\conninfo'`. If
+this fails with a peer-authentication error on Linux, ensure `pg_hba.conf` allows
+password auth (`md5`/`scram-sha-256`) for TCP from `127.0.0.1`, then reload
+PostgreSQL.
 
 ## 3. Configure the engine
 
@@ -69,19 +59,19 @@ allows password (`md5`/`scram-sha-256`) auth for TCP connections from
 cp .env.example .env
 ```
 
-Set at least these two values:
+Set at least these two:
 
 ```bash
 DATABASE_URL=postgres://rsmc:<your-password>@localhost:5432/rsmc
 JWT_SECRET=$(openssl rand -hex 32)
 ```
 
-Leave `REDIS_URL` commented out for single-instance mode. The `.env` file is
-loaded automatically at startup.
+Leave `REDIS_URL` commented out for single-instance mode. `.env` is loaded
+automatically at startup.
 
-> For this manual path you can ignore the `POSTGRES_PASSWORD` field in
-> `.env.example` — that one is only used by the Docker stack. Here the password
-> lives directly inside `DATABASE_URL`.
+> For this manual path, ignore the `POSTGRES_PASSWORD` field in `.env.example`;
+> that's only for the Docker stack. Here the password lives inside
+> `DATABASE_URL`.
 
 ## 4. Build and run
 
@@ -100,7 +90,7 @@ INFO rsmc_engine: listening addr=0.0.0.0:8080
 
 The API is now live at `http://localhost:8080`.
 
-> To build a smaller binary **without** Redis support compiled in:
+> To build a smaller binary without Redis support:
 > `cargo build --release --no-default-features` (then `REDIS_URL` is ignored).
 
 ## 5. Verify it works
@@ -119,7 +109,7 @@ A successful signup returns an `access_token` and a user with `"role":"admin"`.
 
 ## 6. Run as a background service (optional)
 
-A minimal **systemd** unit:
+A minimal systemd unit:
 
 ```ini
 # /etc/systemd/system/rsmc-engine.service

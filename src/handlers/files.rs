@@ -15,7 +15,7 @@ use axum::{
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// `POST /api/v1/files` — multipart upload. Returns metadata + download URL.
+/// `POST /api/v1/files` - multipart upload. Returns metadata + download URL.
 ///
 /// The file is stored on the configured local volume under a UUID-named path.
 /// It starts unattached (`channel_id = NULL`) and becomes channel-scoped when
@@ -101,7 +101,7 @@ pub async fn upload(
     Err(AppError::BadRequest("no 'file' field in upload".into()))
 }
 
-/// `GET /api/v1/files/:id` — download, enforcing channel membership.
+/// `GET /api/v1/files/:id` - download, enforcing channel membership.
 pub async fn download(
     State(state): State<AppState>,
     user: AuthUser,

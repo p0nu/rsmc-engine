@@ -1,5 +1,5 @@
 -- ============================================================================
--- RSMC Engine — Initial Schema
+-- RSMC Engine - Initial Schema
 -- ============================================================================
 -- This migration creates the full relational schema for the collaboration
 -- engine. It is written to be PostgreSQL-native (enums, UUIDs, JSONB, partial

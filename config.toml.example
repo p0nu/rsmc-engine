@@ -1,5 +1,5 @@
 # =============================================================================
-# collab-engine — config.toml (optional)
+# collab-engine - config.toml (optional)
 # =============================================================================
 # This file is OPTIONAL. If present in the working directory it is loaded as a
 # base layer, then overridden by APP__* environment variables and the bare

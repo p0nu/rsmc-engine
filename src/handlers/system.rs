@@ -194,7 +194,7 @@ pub async fn restore(
     })))
 }
 
-/// GET /api/v1/system/backups — list dumps in the backups directory.
+/// GET /api/v1/system/backups - list dumps in the backups directory.
 pub async fn list_backups(
     State(_state): State<AppState>,
     AdminUser(_admin): AdminUser,
@@ -236,7 +236,7 @@ pub async fn list_backups(
     Ok(Json(entries))
 }
 
-/// GET /api/v1/system/info — surface the backup directory and tool availability.
+/// GET /api/v1/system/info - surface the backup directory and tool availability.
 pub async fn info(
     State(_state): State<AppState>,
     AdminUser(_admin): AdminUser,
@@ -273,7 +273,7 @@ pub fn mark_process_start() {
     let _ = PROCESS_START.set(std::time::Instant::now());
 }
 
-/// `GET /api/v1/system/stats` — workspace, server, and database overview for
+/// `GET /api/v1/system/stats` - workspace, server, and database overview for
 /// the admin console. Admin-only. All counts are cheap aggregates; nothing here
 /// exposes secrets or message content.
 pub async fn stats(

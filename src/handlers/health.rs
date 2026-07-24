@@ -3,12 +3,12 @@
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 
-/// `GET /healthz` — liveness; always 200 if the process is up.
+/// `GET /healthz` - liveness; always 200 if the process is up.
 pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// `GET /readyz` — readiness; checks DB connectivity.
+/// `GET /readyz` - readiness; checks DB connectivity.
 pub async fn readyz(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {

@@ -59,7 +59,7 @@ fn init_tracing(cfg: &rsmc_engine::config::LoggingConfig) {
 /// Resolve on Ctrl-C (or SIGTERM on Unix) for a graceful drain.
 async fn shutdown_signal() {
     // If no handler can be installed (e.g. no TTY in a container), don't treat
-    // that as "shut down" — exiting 0 under a restart policy would loop forever.
+    // that as "shut down" - exiting 0 under a restart policy would loop forever.
     // Fall back to a never-resolving future and wait for a real signal.
     let ctrl_c = async {
         match tokio::signal::ctrl_c().await {

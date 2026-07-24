@@ -43,6 +43,17 @@ pub enum ServerEvent {
     Read { channel_id: Uuid, user_id: Uuid, last_read_at: DateTime<Utc> },
     /// A user's presence changed.
     Presence { user_id: Uuid, online: bool, last_seen: DateTime<Utc> },
+    /// A member joined a channel (via invite or self-service join).
+    MemberJoined { channel_id: Uuid, user: super::user::UserPublic },
+    /// A member left or was removed from a channel.
+    MemberLeft { channel_id: Uuid, user_id: Uuid },
+    /// A channel was archived (`archived: true`) or unarchived (`false`).
+    ChannelArchived { channel_id: Uuid, archived: bool },
+    /// A user's custom status changed. `emoji`/`text` are null when cleared.
+    StatusChanged { user_id: Uuid, emoji: Option<String>, text: Option<String> },
+    /// A user's profile (display name and/or avatar) changed. Broadcast
+    /// workspace-wide so every client can patch cached copies of the user.
+    ProfileUpdated { user_id: Uuid, display_name: String, avatar_url: Option<String> },
     /// A notification was created for this user.
     Notification { notification: super::notification::Notification },
     /// Reply to a `Ping`.

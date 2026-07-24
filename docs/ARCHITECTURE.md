@@ -1,35 +1,35 @@
 # Architecture
 
 ```
-                       ┌──────────────────────────────┐
-   HTTP / WebSocket    │          Axum router         │
-   ───────────────────►│   handlers/  middleware/     │
-                       └───────────────┬──────────────┘
-                                       │ AppState (db, jwt, hub, events)
-              ┌────────────────────────┼─────────────────────────┐
-              ▼                        ▼                         ▼
-        ┌───────────┐          ┌──────────────┐          ┌──────────────┐
-        │  SQLx /   │          │   ws::Hub    │          │  EventBus    │
-        │ Postgres  │          │ (live socket │◄────────►│ local + redis│
-        │           │          │  sessions)   │          │ + webhooks   │
-        └───────────┘          └──────────────┘          └──────┬───────┘
-                                                                │
-                                              outbound HTTP ────┘ (HMAC-signed)
+                       +------------------------------+
+   HTTP / WebSocket    |          Axum router         |
+   ------------------->|   handlers/  middleware/     |
+                       +---------------+--------------+
+                                       | AppState (db, jwt, hub, events)
+              +------------------------+-------------------------+
+              v                        v                         v
+        +-----------+          +--------------+          +--------------+
+        |  SQLx /   |          |   ws::Hub    |          |  EventBus    |
+        | Postgres  |          | (live socket |<-------->| local + redis|
+        |           |          |  sessions)   |          | + webhooks   |
+        +-----------+          +--------------+          +------+-------+
+                                                                |
+                                              outbound HTTP ----+ (HMAC-signed)
 ```
 
-- **`handlers/`** — one module per resource; thin, returning typed `AppResult`.
-- **`middleware/`** — extractors for authenticated users (`AuthUser`,
-  `AdminUser`) and request validation (`ValidatedJson`).
-- **`services/`** — cross-cutting logic: access checks, the event bus,
-  notifications, webhook signing/delivery, and the Redis pub/sub bridge.
-- **`ws/`** — the WebSocket handler and the in-process `Hub` that holds live
-  sessions and fans events to subscribers.
-- **`models/`** — domain types, request/response DTOs, and the WS protocol enums.
-- **`error/`** — a single `AppError` mapping cleanly to HTTP status + JSON.
+- **`handlers/`**: one module per resource; thin, returning typed `AppResult`.
+- **`middleware/`**: extractors for authenticated users (`AuthUser`, `AdminUser`) and request validation (`ValidatedJson`).
+- **`services/`**: cross-cutting logic: access checks, the event bus, notifications, webhook signing/delivery, the scheduled-message sweeper, and the Redis pub/sub bridge.
+- **`ws/`**: the WebSocket handler and the in-process `Hub` holding live sessions and fanning events to subscribers.
+- **`models/`**: domain types, request/response DTOs, and the WS protocol enums.
+- **`error/`**: a single `AppError` mapping cleanly to HTTP status + JSON.
 
 When `REDIS_URL` is set, the event bus publishes every realtime event to Redis
 and each instance re-dispatches to its own local sockets, so you can run many
 stateless replicas behind a load balancer.
+
+A background sweeper (spawned at bootstrap) drains due `scheduled_messages` on an
+interval, inserts real messages, and fans out `message_created`.
 
 ## Project layout
 
@@ -41,14 +41,14 @@ src/
   models/      domain types, DTOs, WS protocol
   handlers/    REST + WS route handlers
   middleware/  auth extractors, request validation
-  services/    access control, event bus, notifications, webhooks, pubsub
+  services/    access control, event bus, notifications, webhooks, scheduler, pubsub
   ws/          WebSocket handler + session hub
   error/       AppError + IntoResponse
   state.rs     shared AppState
   lib.rs       router factory + bootstrap
   main.rs      executable entrypoint
 migrations/    SQL schema (applied via sqlx::migrate!)
-docs/          API.md, WEBSOCKET.md, SCHEMA.md, INTEGRATION.md
+docs/          API.md, WEBSOCKET.md, SCHEMA.md, INTEGRATION.md, ...
 tests/         in-process integration tests
 ```
 
@@ -61,7 +61,7 @@ engine inside a larger Axum app or customize startup:
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let settings = rsmc_engine::config::Settings::load()?;
-    let state = rsmc_engine::bootstrap(settings).await?;
+    let state = rsmc_engine::bootstrap(settings).await?;   // also spawns the scheduler
     let app = rsmc_engine::build_router(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;

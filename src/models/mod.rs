@@ -2,6 +2,7 @@
 
 pub mod app_link;
 pub mod channel;
+pub mod compose;
 pub mod file;
 pub mod message;
 pub mod notification;

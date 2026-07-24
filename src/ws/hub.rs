@@ -130,4 +130,13 @@ impl Hub {
             }
         }
     }
+
+    /// Deliver an event to every local session, regardless of subscription.
+    /// Used for workspace-wide broadcasts (presence, profile updates) that every
+    /// connected client needs to see.
+    pub fn dispatch_all(&self, event: &ServerEvent) {
+        for s in self.inner.sessions.iter() {
+            let _ = s.tx.send(event.clone());
+        }
+    }
 }

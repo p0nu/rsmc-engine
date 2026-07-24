@@ -23,6 +23,8 @@ use crate::services::pubsub::PubSub;
 pub enum RoutedEvent {
     Channel { channel_id: Uuid, event: ServerEvent },
     User { user_id: Uuid, event: ServerEvent },
+    /// Broadcast to every session on every instance.
+    All { event: ServerEvent },
 }
 
 #[derive(Clone)]
@@ -85,6 +87,20 @@ impl EventBus {
         }
     }
 
+    /// Emit an event to every connected session across all instances. Used for
+    /// workspace-wide changes (presence, profile updates) that every client
+    /// must observe regardless of which channels it is subscribed to.
+    pub fn emit_all(&self, event: ServerEvent) {
+        self.inner.hub.dispatch_all(&event);
+
+        #[cfg(feature = "redis-pubsub")]
+        if let Some(ps) = &self.inner.pubsub {
+            ps.publish(RoutedEvent::All {
+                event: event.clone(),
+            });
+        }
+    }
+
     /// Re-dispatch an event that arrived from another instance via Redis.
     /// Does NOT republish (avoids loops) and does NOT re-fire webhooks (the
     /// originating instance already did).
@@ -94,6 +110,7 @@ impl EventBus {
                 self.inner.hub.dispatch_channel(channel_id, &event)
             }
             RoutedEvent::User { user_id, event } => self.inner.hub.dispatch_user(user_id, &event),
+            RoutedEvent::All { event } => self.inner.hub.dispatch_all(&event),
         }
     }
 

@@ -17,7 +17,7 @@ WORKDIR /app
 # Cache dependencies: copy manifests first, build only the dependency graph
 # with a stub, then remove the stub's OWN compiled artifacts (keeping the cached
 # deps) so the real source must be recompiled. Without this cleanup a caching
-# hiccup could leave the do-nothing stub binary in place — it exits 0 instantly,
+# hiccup could leave the do-nothing stub binary in place - it exits 0 instantly,
 # which under a restart policy becomes an "exited with code 0 (restarting)" loop.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
@@ -45,7 +45,7 @@ FROM debian:bookworm-slim AS runtime
 # The admin backup/restore feature shells out to pg_dump / pg_restore, and
 # pg_dump REFUSES to run against a newer server (it aborts on version
 # mismatch). The database is PostgreSQL 16, and Debian Bookworm's default
-# postgresql-client is 15 — so we add the official PostgreSQL APT repo (PGDG)
+# postgresql-client is 15 - so we add the official PostgreSQL APT repo (PGDG)
 # and install the matching postgresql-client-16.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

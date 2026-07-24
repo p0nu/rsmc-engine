@@ -65,7 +65,7 @@ pub async fn signup(
 
     // Default channel: the first user creates "general" (and owns it); every
     // user is then auto-added as a member so the workspace is never empty.
-    // Best-effort — a failure here must not block account creation.
+    // Best-effort - a failure here must not block account creation.
     if let Err(e) = ensure_default_membership(&state, user.id, role).await {
         tracing::warn!(error = %e, "could not add user to default channel");
     }
@@ -216,7 +216,7 @@ pub async fn refresh(
     issue_session(&state, &user).await
 }
 
-/// `POST /api/v1/auth/logout` — revokes all refresh tokens for the user.
+/// `POST /api/v1/auth/logout` - revokes all refresh tokens for the user.
 pub async fn logout(State(state): State<AppState>, user: AuthUser) -> AppResult<Json<serde_json::Value>> {
     sqlx::query("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1 AND NOT revoked")
         .bind(user.id)
