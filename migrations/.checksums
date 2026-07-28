@@ -1,0 +1,10 @@
+# Frozen migration checksums (sha256). Managed by scripts/freeze-migrations.sh.
+# Do not edit by hand. An already-frozen migration must never change; add a
+# new migration file instead. See docs/DEPLOY.md.
+3bcbf171cbcdaff637c6eb3ed1839e50d3f69fc1ac9761a330c438e440ccc2cc  migrations/0001_init.sql
+e36c5474ca5acf1c486df56512947a1003c6cc083d458177c489ebd2f989b63a  migrations/0002_app_links.sql
+d365f590862f3818337185e9e2cd3a7f5704c75331cc9c2acc500439d1765621  migrations/0003_reactions.sql
+f73dfeb9c7cab87eea16c91c8e1b5dd086ac9952dab871d5512464e8ac755855  migrations/0004_search_and_pins.sql
+431d6c671a5249b93dc110eec867335925f7570f44860806dd59bb6f6679ca99  migrations/0005_channel_mute.sql
+bb9962810e0bf770ff64b525e56967167c86b652be1074ec64375286d79c8513  migrations/0006_lifecycle_and_status.sql
+f54c21858e8c4585b50838226ccda3e561d114b99e833938515e8fad63cb8987  migrations/0007_avatar_upload.sql

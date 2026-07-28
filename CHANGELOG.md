@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.8.0] - hardening, search filters, pagination, and release binaries
+
+### Added
+- **Rate limiting.** A per-IP limiter on the auth endpoints (login/signup/
+  refresh) protects against brute force, and a per-user limiter (keyed by token
+  subject, IP fallback) across the API guards against write floods. Exhaustion
+  returns `429` with a `Retry-After` header. Configurable via a new
+  `[rate_limit]` section (`enabled`, `auth_max`/`auth_window_secs`,
+  `write_max`/`write_window_secs`) with sensible defaults; in-memory and
+  Redis-swappable in design.
+- **Search filters.** `GET /search` now understands `from:username`, `in:#channel`,
+  `has:file`, and `after:`/`before:` date operators (dates accept `YYYY-MM-DD` or
+  RFC3339), parsed inline from the query or passed as explicit params. Results
+  stay scoped to the caller's channels; an unknown `from:`/`in:` yields no rows
+  rather than leaking a broader search.
+- **Pagination.** `GET /channels/:id/members` and `GET /channels/:id/pins` are
+  now keyset-paginated (`?limit=&cursor=`) and return `{ members|pins,
+  next_cursor }`, so large channels no longer return unbounded payloads.
+- **Prebuilt binaries.** A release workflow builds and attaches engine binaries
+  on tagged releases: a statically linked Linux binary (musl) that runs on any
+  distro with no system dependencies, and an Apple Silicon macOS binary.
+- **Migration guardrails.** `.gitattributes` forces LF on `*.sql` (and other
+  text) to stop line-ending checksum drift; `scripts/check-migrations.sh` plus a
+  committed `migrations/.checksums` manifest and a CI workflow fail any change to
+  an already-frozen migration; a `Makefile` provides `dev`/`dev-fresh`/
+  `reset-db`/`check-migrations`/`freeze-migrations`.
+- **Deploy documentation.** New `docs/DEPLOY.md` covers install styles (Docker /
+  binary / source), the dev-vs-production database lifecycle, the migration
+  guard, a health-check contract, and migration troubleshooting.
+
+### Changed
+- Startup diagnostics are now actionable: a missing/short `JWT_SECRET`, an unset
+  `DATABASE_URL`, or an unreachable database each exit with a clear message
+  telling you exactly what to set (with credentials redacted).
+
+### Notes
+- No new migrations; the schema is unchanged from 0.7.0.
+- If upgrading a database created before the 0.7.0 migration-checksum fix, see
+  the troubleshooting section in `docs/DEPLOY.md`.
+
 ## [0.7.0] - lifecycle, status, scheduling, drafts, avatars, and realtime fixes
 
 ### Added

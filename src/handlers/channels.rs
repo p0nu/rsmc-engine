@@ -160,10 +160,6 @@ pub async fn create_direct(
 
 /// `POST /api/v1/channels/:id/read` - advance the caller's read cursor to now.
 ///
-/// History loading already advances `last_read_at`, but when a channel is the
-/// active view, live messages arrive without re-fetching history. The client
-/// calls this so the server's unread accounting stays in step with what the
-/// user has actually seen on screen.
 pub async fn mark_read(
     State(state): State<AppState>,
     user: AuthUser,
@@ -331,12 +327,34 @@ pub async fn update_channel(
 }
 
 /// `GET /api/v1/channels/:id/members`
+/// Query for `GET /channels/:id/members` pagination. `cursor` is the last
+/// username seen; results continue strictly after it (case-insensitive order).
+#[derive(Debug, serde::Deserialize)]
+pub struct MembersQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MembersPage {
+    pub members: Vec<crate::models::user::UserPublic>,
+    /// Pass back as `cursor` to fetch the next page; null when exhausted.
+    pub next_cursor: Option<String>,
+}
+
 pub async fn list_members(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<crate::models::user::UserPublic>>> {
+    Query(q): Query<MembersQuery>,
+) -> AppResult<Json<MembersPage>> {
     access::require_member(&state.db, id, user.id).await?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+
+    // Keyset paginate by username (the stable sort key). Fetch limit+1 to know
+    // whether another page exists.
     let members: Vec<crate::models::user::User> = sqlx::query_as::<_, crate::models::user::User>(
         r#"
         SELECT u.id, u.email, u.username, u.display_name, u.password_hash, u.role,
@@ -345,13 +363,29 @@ pub async fn list_members(
         FROM users u
         JOIN channel_members m ON m.user_id = u.id
         WHERE m.channel_id = $1
+          AND ($2::text IS NULL OR u.username > $2)
         ORDER BY u.username
+        LIMIT $3
         "#,
     )
     .bind(id)
+    .bind(q.cursor.as_deref())
+    .bind(limit + 1)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(members.into_iter().map(|u| u.to_public()).collect()))
+
+    let has_more = members.len() as i64 > limit;
+    let page: Vec<_> = members.into_iter().take(limit as usize).collect();
+    let next_cursor = if has_more {
+        page.last().map(|u| u.username.clone())
+    } else {
+        None
+    };
+
+    Ok(Json(MembersPage {
+        members: page.into_iter().map(|u| u.to_public()).collect(),
+        next_cursor,
+    }))
 }
 
 /// `POST /api/v1/channels/:id/members`

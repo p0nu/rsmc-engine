@@ -3,6 +3,7 @@
 pub mod access;
 pub mod events;
 pub mod notifications;
+pub mod rate_limit;
 pub mod scheduler;
 pub mod webhooks;
 

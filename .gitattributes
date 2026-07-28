@@ -1,0 +1,40 @@
+# ============================================================================
+# Line-ending and diff policy
+# ============================================================================
+# Why this file exists: database migrations are checksummed byte-for-byte by
+# SQLx. A line-ending flip (LF <-> CRLF) changes those bytes without changing a
+# single visible character, which makes an already-applied migration look
+# "modified" and stops the engine from starting. Windows/WSL git setups are
+# especially prone to this. Forcing LF everywhere removes that entire class of
+# problem.
+
+# Normalize all text files to LF in the repo and on checkout (overrides each
+# user's local core.autocrlf, on every OS).
+* text=auto eol=lf
+
+# Be explicit and unconditional for the files where byte drift causes real
+# breakage or noisy diffs.
+*.sql   text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.sh    text eol=lf
+Dockerfile text eol=lf
+
+# Migrations are the critical case: never let their bytes drift.
+migrations/*.sql text eol=lf
+
+# Binary files must never be line-ending converted (it would corrupt them).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.dump binary

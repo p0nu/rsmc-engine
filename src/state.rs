@@ -4,6 +4,7 @@ use crate::auth::JwtKeys;
 use crate::config::Settings;
 use crate::db::Db;
 use crate::services::events::EventBus;
+use crate::services::rate_limit::RateLimiter;
 use crate::ws::hub::Hub;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ pub struct AppStateInner {
     pub jwt: JwtKeys,
     pub hub: Hub,
     pub events: EventBus,
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
                 jwt,
                 hub,
                 events,
+                rate_limiter: RateLimiter::new(),
             }),
         }
     }

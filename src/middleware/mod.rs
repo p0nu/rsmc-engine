@@ -1,6 +1,7 @@
 //! Request middleware and extractors.
 
 pub mod auth;
+pub mod rate_limit;
 pub mod validate;
 
 pub use auth::{AdminUser, AuthUser};

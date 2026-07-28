@@ -1,0 +1,25 @@
+name: migrations
+
+# Enforce the golden rule mechanically: an already-shipped migration must never change.
+# See scripts/check-migrations.sh and docs/DEPLOY.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "migrations/**"
+      - "scripts/check-migrations.sh"
+      - ".github/workflows/migrations.yml"
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "scripts/check-migrations.sh"
+      - ".github/workflows/migrations.yml"
+
+jobs:
+  immutability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that no frozen migration was modified
+        run: bash scripts/check-migrations.sh

@@ -22,6 +22,8 @@ pub struct Settings {
     pub redis: RedisConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,6 +158,56 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Rate-limiting policy. Two token buckets protect different surfaces:
+/// a stricter per-IP limit on auth endpoints (login/signup/refresh) against
+/// brute force, and a looser per-user limit on write endpoints against floods.
+/// Disabled with `enabled = false`. In-memory by default (per-instance);
+/// sufficient for single-instance deployments, which is the common case.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    /// Master switch. When false, no limiting is applied.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Max auth attempts per IP within the window (login/signup/refresh).
+    #[serde(default = "default_auth_max")]
+    pub auth_max: u32,
+    /// Auth window length, in seconds.
+    #[serde(default = "default_auth_window_secs")]
+    pub auth_window_secs: u64,
+    /// Max write actions per user within the window (send, upload, etc.).
+    #[serde(default = "default_write_max")]
+    pub write_max: u32,
+    /// Write window length, in seconds.
+    #[serde(default = "default_write_window_secs")]
+    pub write_window_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            auth_max: default_auth_max(),
+            auth_window_secs: default_auth_window_secs(),
+            write_max: default_write_max(),
+            write_window_secs: default_write_window_secs(),
+        }
+    }
+}
+
+fn default_auth_max() -> u32 {
+    10
+}
+fn default_auth_window_secs() -> u64 {
+    60
+}
+fn default_write_max() -> u32 {
+    30
+}
+fn default_write_window_secs() -> u64 {
+    10
+}
+
 impl Settings {
     /// Load config. Precedence: `config.toml` → `APP__*` env → bare env vars.
     pub fn load() -> anyhow::Result<Self> {
@@ -208,11 +260,28 @@ impl Settings {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        if self.auth.jwt_secret.len() < 16 {
-            anyhow::bail!("auth.jwt_secret must be at least 16 characters");
-        }
         if self.database.url.is_empty() {
-            anyhow::bail!("database.url (DATABASE_URL) must be set");
+            anyhow::bail!(
+                "DATABASE_URL is not set.\n\
+                 rsmc-engine needs a PostgreSQL 16+ database. Quick options:\n  \
+                 - Docker:   docker run -d -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16\n  \
+                 - Existing: export DATABASE_URL=postgres://user:pw@host:5432/dbname\n\
+                 See docs/NO_DOCKER.md and docs/DEPLOY.md."
+            );
+        }
+        if self.auth.jwt_secret.is_empty() {
+            anyhow::bail!(
+                "JWT_SECRET is not set.\n\
+                 Generate one and set it, for example:\n  \
+                 export JWT_SECRET=$(openssl rand -hex 32)"
+            );
+        }
+        if self.auth.jwt_secret.len() < 16 {
+            anyhow::bail!(
+                "JWT_SECRET is too short ({} chars); use at least 16 (32+ recommended).\n  \
+                 export JWT_SECRET=$(openssl rand -hex 32)",
+                self.auth.jwt_secret.len()
+            );
         }
         Ok(())
     }

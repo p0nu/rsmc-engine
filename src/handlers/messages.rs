@@ -661,54 +661,126 @@ pub async fn search(
     user: AuthUser,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<SearchResponse>> {
-    let term = q.q.trim();
-    if term.is_empty() {
-        return Ok(Json(SearchResponse { results: Vec::new() }));
-    }
+    let parsed = q.parse();
+    let text = parsed.text.trim().to_string();
     let limit = q.clamped_limit();
 
-    // Rank by full-text relevance; fall back to trigram similarity so partial
-    // words still match. Restrict to channels the caller belongs to.
-    let messages: Vec<Message> = if let Some(cid) = q.channel_id {
+    // A search must have at least free text or one narrowing filter; an empty
+    // request returns nothing rather than the whole workspace.
+    let has_filter = parsed.from.is_some()
+        || parsed.in_channel.is_some()
+        || parsed.has.is_some()
+        || parsed.after.is_some()
+        || parsed.before.is_some()
+        || q.channel_id.is_some();
+    if text.is_empty() && !has_filter {
+        return Ok(Json(SearchResponse { results: Vec::new() }));
+    }
+
+    // Resolve a channel scope from either the explicit channel_id or `in:name`.
+
+    let mut scope_authorized = false;
+    let channel_scope: Option<Uuid> = if let Some(cid) = q.channel_id {
         access::require_member(&state.db, cid, user.id).await?;
-        sqlx::query_as::<_, Message>(
-            r#"
-            SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count,
-                   m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by
-            FROM messages m
-            WHERE m.channel_id = $1
-              AND m.deleted_at IS NULL
-              AND (to_tsvector('english', m.content) @@ websearch_to_tsquery('english', $2)
-                   OR m.content ILIKE '%' || $2 || '%')
-            ORDER BY m.created_at DESC
-            LIMIT $3
-            "#,
+        scope_authorized = true;
+        Some(cid)
+    } else if let Some(name) = &parsed.in_channel {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM channels WHERE LOWER(name) = LOWER($1) LIMIT 1",
         )
-        .bind(cid)
-        .bind(term)
-        .bind(limit)
-        .fetch_all(&state.db)
+        .bind(name)
+        .fetch_optional(&state.db)
         .await?
     } else {
-        sqlx::query_as::<_, Message>(
-            r#"
-            SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count,
-                   m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by
-            FROM messages m
-            JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = $1
-            WHERE m.deleted_at IS NULL
-              AND (to_tsvector('english', m.content) @@ websearch_to_tsquery('english', $2)
-                   OR m.content ILIKE '%' || $2 || '%')
-            ORDER BY m.created_at DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(user.id)
-        .bind(term)
-        .bind(limit)
-        .fetch_all(&state.db)
-        .await?
+        None
     };
+
+    // If `in:` named a channel that doesn't exist, return empty rather than
+    // silently searching everything.
+    if parsed.in_channel.is_some() && q.channel_id.is_none() && channel_scope.is_none() {
+        return Ok(Json(SearchResponse { results: Vec::new() }));
+    }
+
+    // Resolve `from:username` to a user id; an unknown user yields no rows.
+    let from_id: Option<Uuid> = if let Some(uname) = &parsed.from {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1",
+        )
+        .bind(uname)
+        .fetch_optional(&state.db)
+        .await?;
+        if id.is_none() {
+            return Ok(Json(SearchResponse { results: Vec::new() }));
+        }
+        id
+    } else {
+        None
+    };
+
+    let wants_files = parsed
+        .has
+        .as_deref()
+        .map(|h| h == "file" || h == "files" || h == "attachment")
+        .unwrap_or(false);
+
+    // Build one dynamic query with only the clauses the filters require.
+    let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT m.id, m.channel_id, m.user_id, m.content, m.parent_id, m.reply_count, \
+         m.edited_at, m.deleted_at, m.created_at, m.pinned_at, m.pinned_by \
+         FROM messages m ",
+    );
+
+    // Scope to caller's channels unless a specific, already-authorized channel
+    // is targeted. When the scope came from `in:name` we keep the join, so a
+    // caller can't read a channel they don't belong to.
+    if !scope_authorized {
+        qb.push("JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ");
+        qb.push_bind(user.id);
+        qb.push(" ");
+    }
+
+    qb.push("WHERE m.deleted_at IS NULL ");
+
+    if let Some(cid) = channel_scope {
+        qb.push("AND m.channel_id = ");
+        qb.push_bind(cid);
+        qb.push(" ");
+    }
+    if let Some(fid) = from_id {
+        qb.push("AND m.user_id = ");
+        qb.push_bind(fid);
+        qb.push(" ");
+    }
+    if let Some(after) = parsed.after {
+        qb.push("AND m.created_at >= ");
+        qb.push_bind(after);
+        qb.push(" ");
+    }
+    if let Some(before) = parsed.before {
+        qb.push("AND m.created_at < ");
+        qb.push_bind(before);
+        qb.push(" ");
+    }
+    if wants_files {
+        qb.push(
+            "AND EXISTS (SELECT 1 FROM message_attachments ma WHERE ma.message_id = m.id) ",
+        );
+    }
+    if !text.is_empty() {
+        qb.push("AND (to_tsvector('english', m.content) @@ websearch_to_tsquery('english', ");
+        qb.push_bind(text.clone());
+        qb.push(") OR m.content ILIKE '%' || ");
+        qb.push_bind(text.clone());
+        qb.push(" || '%') ");
+    }
+
+    qb.push("ORDER BY m.created_at DESC LIMIT ");
+    qb.push_bind(limit);
+
+    let messages: Vec<Message> = qb
+        .build_query_as::<Message>()
+        .fetch_all(&state.db)
+        .await?;
 
     Ok(Json(SearchResponse {
         results: enrich(&state, messages).await?,
@@ -784,23 +856,59 @@ pub async fn unpin_message(
 
 /// `GET /api/v1/channels/:id/pins` - list pinned messages in a channel,
 /// newest pin first.
+/// Query for `GET /channels/:id/pins` pagination. `cursor` is the `pinned_at`
+/// (RFC3339) of the last pin seen; results continue strictly older than it.
+#[derive(Debug, serde::Deserialize)]
+pub struct PinsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PinsPage {
+    pub pins: Vec<MessageView>,
+    /// Pass back as `cursor` for the next page; null when exhausted.
+    pub next_cursor: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub async fn list_pins(
     State(state): State<AppState>,
     user: AuthUser,
     Path(channel_id): Path<Uuid>,
-) -> AppResult<Json<Vec<MessageView>>> {
+    Query(q): Query<PinsQuery>,
+) -> AppResult<Json<PinsPage>> {
     access::require_member(&state.db, channel_id, user.id).await?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+
     let messages: Vec<Message> = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, channel_id, user_id, content, parent_id, reply_count,
                edited_at, deleted_at, created_at, pinned_at, pinned_by
         FROM messages
         WHERE channel_id = $1 AND pinned_at IS NOT NULL AND deleted_at IS NULL
+          AND ($2::timestamptz IS NULL OR pinned_at < $2)
         ORDER BY pinned_at DESC
+        LIMIT $3
         "#,
     )
     .bind(channel_id)
+    .bind(q.cursor)
+    .bind(limit + 1)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(enrich(&state, messages).await?))
+
+    let has_more = messages.len() as i64 > limit;
+    let page: Vec<_> = messages.into_iter().take(limit as usize).collect();
+    let next_cursor = if has_more {
+        page.last().and_then(|m| m.pinned_at)
+    } else {
+        None
+    };
+
+    Ok(Json(PinsPage {
+        pins: enrich(&state, page).await?,
+        next_cursor,
+    }))
 }

@@ -23,7 +23,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rsmc_engine::config::{
-    AuthConfig, DatabaseConfig, LoggingConfig, RedisConfig, ServerConfig, Settings, StorageConfig,
+    AuthConfig, DatabaseConfig, LoggingConfig, RateLimitConfig, RedisConfig, ServerConfig,
+    Settings, StorageConfig,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -81,6 +82,16 @@ async fn test_settings() -> Option<(Settings, sqlx::PgPool)> {
         logging: LoggingConfig {
             format: "text".into(),
             level: "warn".into(),
+        },
+        // Disabled by default so the many requests other tests make aren't
+        // throttled (they all share the "unknown" IP bucket under oneshot).
+        // The dedicated rate-limit test enables it explicitly.
+        rate_limit: RateLimitConfig {
+            enabled: false,
+            auth_max: 10,
+            auth_window_secs: 60,
+            write_max: 30,
+            write_window_secs: 10,
         },
     };
 
@@ -783,7 +794,7 @@ async fn pin_and_unpin_message() {
     // No pins initially.
     let (_, pins) =
         send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
-    assert_eq!(pins.as_array().unwrap().len(), 0);
+    assert_eq!(pins["pins"].as_array().unwrap().len(), 0);
 
     // Pin it.
     let (status, pinned) =
@@ -793,7 +804,7 @@ async fn pin_and_unpin_message() {
 
     let (_, pins) =
         send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
-    let arr = pins.as_array().unwrap();
+    let arr = pins["pins"].as_array().unwrap();
     assert_eq!(arr.len(), 1, "one pinned message");
     assert_eq!(arr[0]["id"], msg_id.as_str());
 
@@ -825,7 +836,7 @@ async fn pin_and_unpin_message() {
 
     let (_, pins) =
         send(&app, "GET", &format!("/api/v1/channels/{ch_id}/pins"), Some(&token), None).await;
-    assert_eq!(pins.as_array().unwrap().len(), 0, "no pins after unpin");
+    assert_eq!(pins["pins"].as_array().unwrap().len(), 0, "no pins after unpin");
 }
 
 /// An @channel broadcast mention notifies every other member of the channel.
@@ -1752,4 +1763,247 @@ async fn avatar_upload_serve_and_delete() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted avatar should 404");
+}
+
+// ===========================================================================
+// 0.8.0: rate limiting
+// ===========================================================================
+
+#[tokio::test]
+async fn auth_endpoints_are_rate_limited_per_ip() {
+    let Some((mut settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    // Enable a tight auth limit for this test: 3 attempts, long window.
+    settings.rate_limit = RateLimitConfig {
+        enabled: true,
+        auth_max: 3,
+        auth_window_secs: 300,
+        write_max: 1000,
+        write_window_secs: 10,
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    // Hammer login with bad credentials. Under oneshot there's no ConnectInfo,
+    // so all requests share the "unknown" IP bucket, exactly what we want here.
+    let creds = json!({ "email": "nobody@example.com", "password": "wrong" });
+
+    let mut statuses = vec![];
+    for _ in 0..5 {
+        let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(creds.clone())).await;
+        statuses.push(status);
+    }
+
+    // First 3 attempts pass through to the handler (401 bad creds); the 4th and
+    // 5th are blocked by the limiter (429).
+    assert_eq!(statuses[0], StatusCode::UNAUTHORIZED, "1st attempt should reach handler");
+    assert_eq!(statuses[2], StatusCode::UNAUTHORIZED, "3rd attempt should reach handler");
+    assert_eq!(statuses[3], StatusCode::TOO_MANY_REQUESTS, "4th attempt should be rate-limited");
+    assert_eq!(statuses[4], StatusCode::TOO_MANY_REQUESTS, "5th attempt should be rate-limited");
+}
+
+#[tokio::test]
+async fn rate_limiting_disabled_lets_everything_through() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    // test_settings() disables rate limiting; confirm no throttling occurs.
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let creds = json!({ "email": "nobody@example.com", "password": "wrong" });
+    for _ in 0..8 {
+        let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(creds.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no request should be rate-limited when disabled");
+    }
+}
+
+// ===========================================================================
+// 0.8.0: search filters
+// ===========================================================================
+
+#[tokio::test]
+async fn search_filters_by_from_in_and_has() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (owner, owner_id) = signup(&app, "alice@example.com", "alice").await;
+    let (bob, bob_id) = signup(&app, "bob@example.com", "bob").await;
+
+    let cid = make_channel(&app, &owner, "project", false).await;
+    // add bob to the channel
+    send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{cid}/members"),
+        Some(&owner),
+        Some(json!({ "user_id": bob_id })),
+    )
+    .await;
+
+    // alice and bob both post messages containing "deploy".
+    send(&app, "POST", &format!("/api/v1/channels/{cid}/messages"), Some(&owner),
+        Some(json!({ "content": "deploy the release now" }))).await;
+    send(&app, "POST", &format!("/api/v1/channels/{cid}/messages"), Some(&bob),
+        Some(json!({ "content": "deploy failed, rolling back" }))).await;
+
+    // Plain search: both match.
+    let (_, all) = send(&app, "GET", "/api/v1/search?q=deploy", Some(&owner), None).await;
+    assert_eq!(all["results"].as_array().unwrap().len(), 2, "both 'deploy' messages match");
+
+    // from:bob -> only bob's message.
+    let (_, from_bob) = send(&app, "GET", "/api/v1/search?q=from:bob%20deploy", Some(&owner), None).await;
+    let hits = from_bob["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "only bob's deploy message");
+    assert_eq!(hits[0]["user_id"], json!(bob_id));
+
+    // in:#project -> both, in:#nonexistent -> none.
+    let (_, in_proj) = send(&app, "GET", "/api/v1/search?q=in:%23project%20deploy", Some(&owner), None).await;
+    assert_eq!(in_proj["results"].as_array().unwrap().len(), 2);
+    let (_, in_missing) = send(&app, "GET", "/api/v1/search?q=in:%23nope%20deploy", Some(&owner), None).await;
+    assert_eq!(in_missing["results"].as_array().unwrap().len(), 0, "unknown channel yields nothing");
+
+    // from:ghost (unknown user) -> none.
+    let (_, from_ghost) = send(&app, "GET", "/api/v1/search?q=from:ghost%20deploy", Some(&owner), None).await;
+    assert_eq!(from_ghost["results"].as_array().unwrap().len(), 0);
+
+    let _ = owner_id;
+}
+
+#[tokio::test]
+async fn search_has_file_and_date_filters() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state.clone());
+
+    let (token, _uid) = signup(&app, "filer@example.com", "filer").await;
+    let cid = make_channel(&app, &token, "files-ch", false).await;
+
+    // One message with an attachment, one without, both containing "report".
+    // Upload a file first.
+    let boundary = "----rsmcfiletest";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"r.txt\"\r\n");
+    body.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
+    body.extend_from_slice(b"report data");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let req = Request::builder()
+        .method("POST").uri("/api/v1/files")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .body(Body::from(body)).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let uploaded: Value = serde_json::from_slice(&bytes).unwrap();
+    let file_id = uploaded["id"].as_str().unwrap().to_string();
+
+    send(&app, "POST", &format!("/api/v1/channels/{cid}/messages"), Some(&token),
+        Some(json!({ "content": "report with attachment", "attachment_ids": [file_id] }))).await;
+    send(&app, "POST", &format!("/api/v1/channels/{cid}/messages"), Some(&token),
+        Some(json!({ "content": "report without attachment" }))).await;
+
+    // has:file -> only the one with an attachment.
+    let (_, has_file) = send(&app, "GET", "/api/v1/search?q=has:file%20report", Some(&token), None).await;
+    assert_eq!(has_file["results"].as_array().unwrap().len(), 1, "only the attachment message");
+
+    // after: tomorrow -> nothing (all messages are from now).
+    let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let (_, after) = send(&app, "GET", &format!("/api/v1/search?q=after:{tomorrow}%20report"), Some(&token), None).await;
+    assert_eq!(after["results"].as_array().unwrap().len(), 0, "nothing after tomorrow");
+
+    // before: tomorrow -> both.
+    let (_, before) = send(&app, "GET", &format!("/api/v1/search?q=before:{tomorrow}%20report"), Some(&token), None).await;
+    assert_eq!(before["results"].as_array().unwrap().len(), 2, "both before tomorrow");
+}
+
+// ===========================================================================
+// 0.8.0: pagination on members and pins
+// ===========================================================================
+
+#[tokio::test]
+async fn members_list_paginates() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (owner, _oid) = signup(&app, "cap@example.com", "captain").await;
+    let cid = make_channel(&app, &owner, "crew", false).await;
+
+    // Add several members so pagination has something to page.
+    for i in 0..5 {
+        let (_, u) = signup(&app, &format!("m{i}@example.com"), &format!("member{i}")).await;
+        let _ = u;
+    }
+    // Re-fetch their ids via user search and add them.
+    for i in 0..5 {
+        let (_, found) = send(&app, "GET", &format!("/api/v1/users?q=member{i}"), Some(&owner), None).await;
+        let uid = found.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+        send(&app, "POST", &format!("/api/v1/channels/{cid}/members"), Some(&owner),
+            Some(json!({ "user_id": uid }))).await;
+    }
+
+    // Page size 3: first page has 3 + a cursor.
+    let (status, page1) = send(&app, "GET", &format!("/api/v1/channels/{cid}/members?limit=3"), Some(&owner), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page1["members"].as_array().unwrap().len(), 3, "first page of 3");
+    assert!(page1["next_cursor"].is_string(), "more pages remain");
+
+    // Follow the cursor for the rest (6 members total: captain + 5).
+    let cursor = page1["next_cursor"].as_str().unwrap();
+    let (_, page2) = send(&app, "GET",
+        &format!("/api/v1/channels/{cid}/members?limit=3&cursor={cursor}"), Some(&owner), None).await;
+    let n2 = page2["members"].as_array().unwrap().len();
+    assert_eq!(n2, 3, "second page of 3");
+
+    // No overlap between pages (usernames strictly increase).
+    let last1 = page1["members"].as_array().unwrap().last().unwrap()["username"].as_str().unwrap();
+    let first2 = page2["members"].as_array().unwrap()[0]["username"].as_str().unwrap();
+    assert!(first2 > last1, "pages don't overlap");
+}
+
+#[tokio::test]
+async fn pins_list_paginates() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (token, _uid) = signup(&app, "pinner@example.com", "pinner").await;
+    let cid = make_channel(&app, &token, "pins-ch", false).await;
+
+    // Create and pin 4 messages.
+    for i in 0..4 {
+        let (_, m) = send(&app, "POST", &format!("/api/v1/channels/{cid}/messages"), Some(&token),
+            Some(json!({ "content": format!("pin me {i}") }))).await;
+        let mid = m["id"].as_str().unwrap().to_string();
+        send(&app, "POST", &format!("/api/v1/messages/{mid}/pin"), Some(&token), None).await;
+    }
+
+    // Page size 2.
+    let (status, page1) = send(&app, "GET", &format!("/api/v1/channels/{cid}/pins?limit=2"), Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page1["pins"].as_array().unwrap().len(), 2, "first page of 2 pins");
+    assert!(page1["next_cursor"].is_string(), "more pins remain");
+
+    let cursor = page1["next_cursor"].as_str().unwrap();
+    let (_, page2) = send(&app, "GET",
+        &format!("/api/v1/channels/{cid}/pins?limit=2&cursor={cursor}"), Some(&token), None).await;
+    assert_eq!(page2["pins"].as_array().unwrap().len(), 2, "second page of 2 pins");
+    assert!(page2["next_cursor"].is_null(), "no more pins after 4");
 }

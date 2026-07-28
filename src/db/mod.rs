@@ -25,7 +25,22 @@ pub async fn connect(cfg: &DatabaseConfig) -> anyhow::Result<Db> {
         // Validate on checkout so a connection left bad by a restore is replaced.
         .test_before_acquire(true)
         .connect_with(connect_opts)
-        .await?;
+        .await
+        .map_err(|e| {
+            // Redact credentials from the URL before showing it.
+            let safe = cfg
+                .url
+                .split('@')
+                .next_back()
+                .map(|host| format!("...@{host}"))
+                .unwrap_or_else(|| "(unparseable DATABASE_URL)".to_string());
+            anyhow::anyhow!(
+                "could not connect to PostgreSQL ({safe}): {e}\n\
+                 Check that the database is running and DATABASE_URL is correct. Quick start:\n  \
+                 docker run -d -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16\n\
+                 See docs/DEPLOY.md for troubleshooting."
+            )
+        })?;
 
     tracing::info!(
         max = cfg.max_connections,

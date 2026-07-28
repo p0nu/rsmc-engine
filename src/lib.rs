@@ -38,12 +38,19 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state);
     let max_body = state.config.server.max_body_bytes;
 
-    let api = Router::new()
-        // ---- auth ----
+    // Auth endpoints get a strict per-IP limiter (brute-force protection).
+    let auth_routes = Router::new()
         .route("/auth/signup", post(handlers::auth::signup))
         .route("/auth/login", post(handlers::auth::login))
         .route("/auth/refresh", post(handlers::auth::refresh))
         .route("/auth/logout", post(handlers::auth::logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::auth_limit,
+        ));
+
+    let api = Router::new()
+        .merge(auth_routes)
         // ---- users ----
         .route(
             "/users/me",
@@ -184,7 +191,13 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::delete(handlers::app_links::delete_app_link),
         )
         // ---- websocket ----
-        .route("/ws", get(ws::ws_handler));
+        .route("/ws", get(ws::ws_handler))
+        // Per-user write/flood limiter across the API (keyed by token subject,
+        // falls back to IP when unauthenticated). Generous by default.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::write_limit,
+        ));
 
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
@@ -263,6 +276,27 @@ pub async fn bootstrap(settings: config::Settings) -> anyhow::Result<AppState> {
 
     // Start the background scheduler that delivers due scheduled messages.
     services::scheduler::spawn(state.clone());
+
+    // Periodically evict stale rate-limit windows to bound memory.
+    {
+        let limiter = state.rate_limiter.clone();
+        let max_window = std::time::Duration::from_secs(
+            state
+                .config
+                .rate_limit
+                .auth_window_secs
+                .max(state.config.rate_limit.write_window_secs)
+                .max(1)
+                * 2,
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                limiter.sweep(max_window);
+            }
+        });
+    }
 
     Ok(state)
 }

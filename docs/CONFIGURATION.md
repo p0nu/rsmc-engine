@@ -22,6 +22,11 @@ Settings are layered, later sources overriding earlier ones:
 | `APP__STORAGE__BACKUP_DIR` | `/app/backups` | Directory for admin DB backups |
 | `APP__DATABASE__AUTO_MIGRATE` | `true` | Run migrations on startup |
 | `APP__LOGGING__FORMAT` | `text` | `text` or `json` |
+| `APP__RATE_LIMIT__ENABLED` | `true` | Master switch for rate limiting |
+| `APP__RATE_LIMIT__AUTH_MAX` | `10` | Auth attempts per IP per window |
+| `APP__RATE_LIMIT__AUTH_WINDOW_SECS` | `60` | Auth limiter window |
+| `APP__RATE_LIMIT__WRITE_MAX` | `30` | Writes per user per window |
+| `APP__RATE_LIMIT__WRITE_WINDOW_SECS` | `10` | Write limiter window |
 
 See `.env.example` for the full annotated list.
 

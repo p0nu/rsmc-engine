@@ -107,6 +107,7 @@ PostgreSQL setup (Redis optional).
 - [docs/WEBSOCKET.md](docs/WEBSOCKET.md): realtime protocol and event types.
 - [docs/SCHEMA.md](docs/SCHEMA.md): database schema.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): settings, backups, upload limits.
+- [docs/DEPLOY.md](docs/DEPLOY.md): database lifecycle (dev vs prod), migration safety, health checks, troubleshooting.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): internals, module layout, embedding the crate.
 
 ## Testing
