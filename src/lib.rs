@@ -44,6 +44,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/login", post(handlers::auth::login))
         .route("/auth/refresh", post(handlers::auth::refresh))
         .route("/auth/logout", post(handlers::auth::logout))
+        .route("/auth/verify-email", post(handlers::email::verify_email))
+        .route(
+            "/auth/password-reset",
+            post(handlers::email::request_password_reset),
+        )
+        .route(
+            "/auth/password-reset/confirm",
+            post(handlers::email::confirm_password_reset),
+        )
+        .route(
+            "/auth/confirm-email-change",
+            post(handlers::email::confirm_email_change),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::rate_limit::auth_limit,
@@ -57,6 +70,14 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::users::me).patch(handlers::users::update_me),
         )
         .route("/users/me/status", put(handlers::users::set_status))
+        .route(
+            "/users/me/verify-email",
+            post(handlers::email::send_verification),
+        )
+        .route(
+            "/users/me/email",
+            post(handlers::email::request_email_change),
+        )
         .route(
             "/users/me/avatar",
             post(handlers::avatars::upload_avatar).delete(handlers::avatars::delete_avatar),
@@ -243,6 +264,18 @@ pub async fn bootstrap(settings: config::Settings) -> anyhow::Result<AppState> {
         db::migrate(&pool).await?;
         tracing::info!("database migrations applied");
     }
+
+    // Log the effective, resolved configuration once at startup. This makes
+    // first-run behavior transparent: where uploads/backups are written, whether
+    // rate limiting is on, and whether the process is single- or multi-instance.
+    // It's the first thing to check when something like a backup "goes missing".
+    tracing::info!(
+        upload_dir = %settings.storage.upload_dir,
+        backup_dir = %settings.storage.backup_dir,
+        rate_limiting = settings.rate_limit.enabled,
+        auto_migrate = settings.database.auto_migrate,
+        "effective configuration"
+    );
 
     let jwt = auth::JwtKeys::new(
         &settings.auth.jwt_secret,

@@ -114,6 +114,7 @@ impl User {
             status_emoji,
             status_text,
             status_expires_at,
+            email_verified: None,
         }
     }
 }
@@ -135,6 +136,10 @@ pub struct UserPublic {
     pub status_text: Option<String>,
     #[serde(default)]
     pub status_expires_at: Option<DateTime<Utc>>,
+    /// Only populated on the self endpoint (`/users/me`); None elsewhere so a
+    /// user's verification state is never exposed to other users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Validate)]

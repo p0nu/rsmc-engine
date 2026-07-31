@@ -1,6 +1,6 @@
 [package]
 name = "rsmc-engine"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["RSMC Engine Contributors"]
 description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"
@@ -50,6 +50,8 @@ base64 = "0.22"
 jsonwebtoken = "9.3"
 argon2 = "0.5"
 rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
 
 # Redis pub/sub (optional scaling)
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"], optional = true }

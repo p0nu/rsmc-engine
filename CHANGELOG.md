@@ -1,6 +1,36 @@
 # Changelog
 
-## [0.8.0] - hardening, search filters, pagination, and release binaries
+## [0.9.0] - email flows, bare-binary defaults, and startup diagnostics
+
+### Added
+- **Email: verification, password reset, and email change.** New endpoints under
+  `/auth` and `/users/me` issue single-use, expiring, hash-stored tokens for
+  verifying an address, resetting a forgotten password, and changing an email
+  (with re-verification of the new address). A new additive migration (0008)
+  stores an `email_verified` flag and an `email_tokens` table.
+- **Pluggable mail transport.** With no SMTP configured, a console transport logs
+  the action link to the server log, so the flows work out of the box in
+  development. Setting `smtp_host` switches to SMTP delivery. New `[email]`
+  config section covers transport, the public base URL used in links, token
+  lifetime, and a verification policy.
+- **Soft-by-default verification.** Unverified users can still log in unless
+  `require_verification` is set, in which case login is blocked until the address
+  is confirmed. The first user is always auto-verified so a fresh instance cannot
+  lock itself out before email is configured.
+
+### Changed
+- **Bare-binary friendly storage defaults.** Upload and backup directories now
+  default to `./uploads` and `./backups` relative to the working directory
+  instead of container paths, so the standalone binary works without extra
+  configuration. Docker deployments set explicit paths and are unaffected.
+- **Clearer first-run diagnostics.** Missing or short secrets, a missing database
+  URL, and an unreachable database each produce a specific, actionable message,
+  and the effective configuration (active paths, whether rate limiting is on) is
+  logged once at startup.
+
+### Notes
+- No breaking changes. The 0008 migration is additive and nullable; existing
+  databases upgrade with no manual steps.
 
 ### Added
 - **Rate limiting.** A per-IP limiter on the auth endpoints (login/signup/

@@ -3,6 +3,7 @@
 use crate::auth::JwtKeys;
 use crate::config::Settings;
 use crate::db::Db;
+use crate::services::email::MailTransport;
 use crate::services::events::EventBus;
 use crate::services::rate_limit::RateLimiter;
 use crate::ws::hub::Hub;
@@ -21,10 +22,12 @@ pub struct AppStateInner {
     pub hub: Hub,
     pub events: EventBus,
     pub rate_limiter: RateLimiter,
+    pub mail: Arc<dyn MailTransport>,
 }
 
 impl AppState {
     pub fn new(db: Db, config: Settings, jwt: JwtKeys, hub: Hub, events: EventBus) -> Self {
+        let mail = crate::services::email::build_transport(&config.email);
         Self {
             inner: Arc::new(AppStateInner {
                 db,
@@ -33,6 +36,7 @@ impl AppState {
                 hub,
                 events,
                 rate_limiter: RateLimiter::new(),
+                mail,
             }),
         }
     }

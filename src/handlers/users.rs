@@ -30,7 +30,14 @@ async fn load_user(state: &AppState, id: Uuid) -> AppResult<User> {
 
 /// `GET /api/v1/users/me`
 pub async fn me(State(state): State<AppState>, user: AuthUser) -> AppResult<Json<UserPublic>> {
-    Ok(Json(load_user(&state, user.id).await?.to_public()))
+    let mut public = load_user(&state, user.id).await?.to_public();
+    // Attach the caller's own verification state (self endpoint only).
+    let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(&state.db)
+        .await?;
+    public.email_verified = Some(verified);
+    Ok(Json(public))
 }
 
 /// `PATCH /api/v1/users/me`

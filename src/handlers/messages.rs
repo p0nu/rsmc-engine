@@ -129,6 +129,7 @@ fn placeholder_user(id: Uuid) -> UserPublic {
         status_emoji: None,
         status_text: None,
         status_expires_at: None,
+        email_verified: None,
     }
 }
 
@@ -678,7 +679,9 @@ pub async fn search(
     }
 
     // Resolve a channel scope from either the explicit channel_id or `in:name`.
-
+    // Membership is enforced in both cases: an explicit channel_id via an
+    // up-front check, and an `in:` name via the membership join that is kept
+    // whenever the scope did not come from an already-authorized channel_id.
     let mut scope_authorized = false;
     let channel_scope: Option<Uuid> = if let Some(cid) = q.channel_id {
         access::require_member(&state.db, cid, user.id).await?;

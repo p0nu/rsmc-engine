@@ -45,11 +45,14 @@ pub async fn signup(
     } else {
         UserRole::Member
     };
+    // The first user is auto-verified so a fresh instance can't lock itself out
+    // before email/SMTP is configured. Everyone else starts unverified.
+    let email_verified = count == 0;
 
     let user: User = sqlx::query_as::<_, User>(
         r#"
-        INSERT INTO users (id, email, username, display_name, password_hash, role)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO users (id, email, username, display_name, password_hash, role, email_verified)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, email, username, display_name, password_hash, role,
                   avatar_url, is_active, created_at, updated_at
         "#,
@@ -60,6 +63,7 @@ pub async fn signup(
     .bind(&req.display_name)
     .bind(&hash)
     .bind(role)
+    .bind(email_verified)
     .fetch_one(&state.db)
     .await?;
 
@@ -167,6 +171,20 @@ pub async fn login(
         return Err(AppError::Unauthorized);
     }
 
+    // Soft by default: unverified users may log in. When the instance requires
+    // verification, block login until the email is confirmed (with a clear code
+    // the UI can act on to offer a resend).
+    if state.config.email.require_verification {
+        let verified: bool =
+            sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+                .bind(user.id)
+                .fetch_one(&state.db)
+                .await?;
+        if !verified {
+            return Err(AppError::Forbidden("email not verified".into()));
+        }
+    }
+
     issue_session(&state, &user).await
 }
 
@@ -242,12 +260,24 @@ async fn issue_session(state: &AppState, user: &User) -> AppResult<Json<AuthResp
     .execute(&state.db)
     .await?;
 
+    // Include the caller's own verification state so the client can render the
+    // unverified banner immediately after login/signup (not only after a later
+    // /users/me call).
+    let email_verified: bool =
+        sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(true);
+    let mut public = user.to_public();
+    public.email_verified = Some(email_verified);
+
     Ok(Json(AuthResponse {
         access_token: pair.access,
         refresh_token: pair.refresh,
         token_type: "Bearer",
         expires_in: pair.access_expires_in,
-        user: user.to_public(),
+        user: public,
     }))
 }
 

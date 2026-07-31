@@ -1,6 +1,7 @@
 //! Business-logic services shared across handlers.
 
 pub mod access;
+pub mod email;
 pub mod events;
 pub mod notifications;
 pub mod rate_limit;

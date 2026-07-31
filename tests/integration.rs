@@ -23,8 +23,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rsmc_engine::config::{
-    AuthConfig, DatabaseConfig, LoggingConfig, RateLimitConfig, RedisConfig, ServerConfig,
-    Settings, StorageConfig,
+    AuthConfig, DatabaseConfig, EmailConfig, LoggingConfig, RateLimitConfig, RedisConfig,
+    ServerConfig, Settings, StorageConfig,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -60,7 +60,7 @@ async fn test_settings() -> Option<(Settings, sqlx::PgPool)> {
             max_body_bytes: 25 * 1024 * 1024,
         },
         database: DatabaseConfig {
-            url: scoped_url,
+            url: scoped_url.clone(),
             max_connections: 5,
             min_connections: 1,
             acquire_timeout_secs: 10,
@@ -74,6 +74,10 @@ async fn test_settings() -> Option<(Settings, sqlx::PgPool)> {
         storage: StorageConfig {
             upload_dir: std::env::temp_dir()
                 .join(format!("rsmc-test-{schema}"))
+                .to_string_lossy()
+                .into_owned(),
+            backup_dir: std::env::temp_dir()
+                .join(format!("rsmc-test-backups-{schema}"))
                 .to_string_lossy()
                 .into_owned(),
             max_file_bytes: 25 * 1024 * 1024,
@@ -93,9 +97,25 @@ async fn test_settings() -> Option<(Settings, sqlx::PgPool)> {
             write_max: 30,
             write_window_secs: 10,
         },
+        email: EmailConfig {
+            from_address: "test@rsmc.local".into(),
+            public_base_url: String::new(),
+            require_verification: false,
+            token_ttl_secs: 3600,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+        },
     };
 
-    Some((settings, admin_pool))
+    // A pool scoped to this test's schema, so tests can make direct DB
+    // assertions against the same tables the engine uses.
+    let scoped_pool = sqlx::PgPool::connect(&scoped_url)
+        .await
+        .expect("connect scoped test pool");
+
+    Some((settings, scoped_pool))
 }
 
 /// Convenience: send a JSON request through the router and return (status, body).
@@ -2006,4 +2026,196 @@ async fn pins_list_paginates() {
         &format!("/api/v1/channels/{cid}/pins?limit=2&cursor={cursor}"), Some(&token), None).await;
     assert_eq!(page2["pins"].as_array().unwrap().len(), 2, "second page of 2 pins");
     assert!(page2["next_cursor"].is_null(), "no more pins after 4");
+}
+
+// ===========================================================================
+// 0.9.0: email verification, password reset, email change
+// ===========================================================================
+
+
+#[tokio::test]
+async fn first_user_is_auto_verified() {
+    let Some((settings, pool)) = test_settings().await else { return; };
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "first@example.com", "username": "first",
+        "display_name": "First", "password": "correct horse battery"
+    }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let verified: bool = sqlx::query_scalar(
+        "SELECT email_verified FROM users WHERE LOWER(email) = 'first@example.com'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(verified, "first user should be auto-verified");
+}
+
+#[tokio::test]
+async fn second_user_is_unverified_then_can_verify() {
+    let Some((settings, pool)) = test_settings().await else { return; };
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    // First user (auto-verified admin)
+    send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "admin@example.com", "username": "admin",
+        "display_name": "Admin", "password": "correct horse battery"
+    }))).await;
+
+    // Second user - unverified
+    let (_, signup) = send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "bob@example.com", "username": "bob",
+        "display_name": "Bob", "password": "correct horse battery"
+    }))).await;
+    let token = signup["access_token"].as_str().unwrap().to_string();
+
+    let verified: bool = sqlx::query_scalar(
+        "SELECT email_verified FROM users WHERE LOWER(email) = 'bob@example.com'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(!verified, "second user should start unverified");
+
+    // Request a verification email (console transport). Then read the token row
+    // and confirm via a DB-issued raw token: issue a known token directly so we
+    // can exercise the verify endpoint end to end.
+    let (status, _) = send(&app, "POST", "/api/v1/users/me/verify-email",
+        Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A verify token now exists; craft a raw token, store its hash, and confirm.
+    let raw = "known-verify-token-abc123";
+    let hash = rsmc_engine::services::email::hash_token(raw);
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM users WHERE LOWER(email) = 'bob@example.com'")
+        .fetch_one(&pool).await.unwrap();
+    sqlx::query("INSERT INTO email_tokens (user_id, purpose, token_hash, expires_at)
+                 VALUES ($1, 'verify', $2, now() + interval '1 hour')")
+        .bind(user_id).bind(&hash).execute(&pool).await.unwrap();
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/verify-email", None,
+        Some(json!({ "token": raw }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let verified: bool = sqlx::query_scalar(
+        "SELECT email_verified FROM users WHERE id = $1")
+        .bind(user_id).fetch_one(&pool).await.unwrap();
+    assert!(verified, "user should be verified after confirming token");
+}
+
+#[tokio::test]
+async fn strict_verification_blocks_unverified_login() {
+    let Some((mut settings, _pool)) = test_settings().await else { return; };
+    settings.email.require_verification = true;
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    // First user auto-verified - can log in.
+    send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "admin@example.com", "username": "admin",
+        "display_name": "Admin", "password": "correct horse battery"
+    }))).await;
+
+    // Second user unverified - signup ok but login blocked under strict policy.
+    send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "carol@example.com", "username": "carol",
+        "display_name": "Carol", "password": "correct horse battery"
+    }))).await;
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(json!({
+        "email": "carol@example.com", "password": "correct horse battery"
+    }))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unverified login blocked when strict");
+
+    // Admin (verified) can still log in.
+    let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(json!({
+        "email": "admin@example.com", "password": "correct horse battery"
+    }))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn password_reset_flow_changes_password() {
+    let Some((settings, pool)) = test_settings().await else { return; };
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "dave@example.com", "username": "dave",
+        "display_name": "Dave", "password": "old password here"
+    }))).await;
+
+    // Request reset - always 200, even for unknown emails.
+    let (status, _) = send(&app, "POST", "/api/v1/auth/password-reset", None,
+        Some(json!({ "email": "dave@example.com" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, "POST", "/api/v1/auth/password-reset", None,
+        Some(json!({ "email": "nobody@example.com" }))).await;
+    assert_eq!(status, StatusCode::OK, "unknown email still returns 200");
+
+    // Issue a known reset token and confirm a new password.
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM users WHERE LOWER(email) = 'dave@example.com'")
+        .fetch_one(&pool).await.unwrap();
+    let raw = "known-reset-token-xyz789";
+    let hash = rsmc_engine::services::email::hash_token(raw);
+    sqlx::query("INSERT INTO email_tokens (user_id, purpose, token_hash, expires_at)
+                 VALUES ($1, 'reset', $2, now() + interval '1 hour')")
+        .bind(user_id).bind(&hash).execute(&pool).await.unwrap();
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/password-reset/confirm", None,
+        Some(json!({ "token": raw, "new_password": "brand new password" }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Old password fails, new password works.
+    let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(json!({
+        "email": "dave@example.com", "password": "old password here"
+    }))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(json!({
+        "email": "dave@example.com", "password": "brand new password"
+    }))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn email_change_flow_updates_address() {
+    let Some((settings, pool)) = test_settings().await else { return; };
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    let (_, signup) = send(&app, "POST", "/api/v1/auth/signup", None, Some(json!({
+        "email": "eve@example.com", "username": "eve",
+        "display_name": "Eve", "password": "correct horse battery"
+    }))).await;
+    let token = signup["access_token"].as_str().unwrap().to_string();
+
+    // Request change to a new address.
+    let (status, _) = send(&app, "POST", "/api/v1/users/me/email", Some(&token),
+        Some(json!({ "new_email": "eve.new@example.com" }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Issue a known change token carrying the new email, then confirm.
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM users WHERE LOWER(email) = 'eve@example.com'")
+        .fetch_one(&pool).await.unwrap();
+    let raw = "known-change-token-def456";
+    let hash = rsmc_engine::services::email::hash_token(raw);
+    sqlx::query("INSERT INTO email_tokens (user_id, purpose, token_hash, new_email, expires_at)
+                 VALUES ($1, 'change', $2, 'eve.new@example.com', now() + interval '1 hour')")
+        .bind(user_id).bind(&hash).execute(&pool).await.unwrap();
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/confirm-email-change", None,
+        Some(json!({ "token": raw }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (email, verified): (String, bool) = sqlx::query_as(
+        "SELECT email, email_verified FROM users WHERE id = $1")
+        .bind(user_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(email, "eve.new@example.com");
+    assert!(verified, "email should be verified after change");
+}
+
+#[tokio::test]
+async fn invalid_email_token_is_rejected() {
+    let Some((settings, _pool)) = test_settings().await else { return; };
+    let app = rsmc_engine::build_router(rsmc_engine::bootstrap(settings).await.unwrap());
+
+    let (status, _) = send(&app, "POST", "/api/v1/auth/verify-email", None,
+        Some(json!({ "token": "totally-bogus-token" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

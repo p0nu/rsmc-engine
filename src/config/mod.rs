@@ -24,6 +24,8 @@ pub struct Settings {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub email: EmailConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +116,9 @@ pub struct StorageConfig {
     /// Local filesystem directory for uploaded files.
     #[serde(default = "default_upload_dir")]
     pub upload_dir: String,
+    /// Local filesystem directory for database backups.
+    #[serde(default = "default_backup_dir")]
+    pub backup_dir: String,
     /// Maximum upload size in bytes (default 25 MiB).
     #[serde(default = "default_body_limit")]
     pub max_file_bytes: usize,
@@ -123,6 +128,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             upload_dir: default_upload_dir(),
+            backup_dir: default_backup_dir(),
             max_file_bytes: default_body_limit(),
         }
     }
@@ -156,6 +162,75 @@ impl Default for LoggingConfig {
             level: default_log_level(),
         }
     }
+}
+
+/// Email delivery and verification policy.
+///
+/// Transport: if `smtp_host` is set, mail is sent via SMTP; otherwise the
+/// engine uses a console transport that logs the action link to the server log.
+/// The console default means email flows work out of the box in development with
+/// zero configuration (you copy the link from the log), while production sets
+/// SMTP. Verification is soft by default: unverified users can still log in
+/// (with the app free to nudge them). Set `require_verification = true` to block
+/// login until verified. The first user created is always auto-verified so a
+/// fresh instance cannot lock itself out before email is configured.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EmailConfig {
+    /// Address used in the From header.
+    #[serde(default = "default_from_address")]
+    pub from_address: String,
+    /// Base URL the app is reached at, used to build links in emails
+    /// (e.g. https://chat.example.com). Falls back to a relative link if empty.
+    #[serde(default)]
+    pub public_base_url: String,
+    /// If true, users must verify their email before they can log in.
+    #[serde(default)]
+    pub require_verification: bool,
+    /// How long verification / reset / change tokens remain valid.
+    #[serde(default = "default_email_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+    /// SMTP host. If empty, the console transport is used (links go to the log).
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_username: String,
+    #[serde(default)]
+    pub smtp_password: String,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            from_address: default_from_address(),
+            public_base_url: String::new(),
+            require_verification: false,
+            token_ttl_secs: default_email_token_ttl_secs(),
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+        }
+    }
+}
+
+impl EmailConfig {
+    /// True when SMTP is configured; otherwise the console transport is used.
+    pub fn smtp_enabled(&self) -> bool {
+        !self.smtp_host.trim().is_empty()
+    }
+}
+
+fn default_from_address() -> String {
+    "no-reply@rsmc.local".to_string()
+}
+fn default_email_token_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+fn default_smtp_port() -> u16 {
+    587
 }
 
 /// Rate-limiting policy. Two token buckets protect different surfaces:
@@ -325,6 +400,9 @@ fn default_refresh_ttl() -> i64 {
 }
 fn default_upload_dir() -> String {
     "./uploads".to_string()
+}
+fn default_backup_dir() -> String {
+    "./backups".to_string()
 }
 fn default_log_format() -> String {
     "pretty".to_string()
