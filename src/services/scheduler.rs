@@ -28,6 +28,9 @@ pub fn spawn(state: AppState) {
             if let Err(e) = sweep_once(&state).await {
                 tracing::warn!(error = %e, "scheduled-message sweep failed");
             }
+            if let Err(e) = sweep_retention(&state).await {
+                tracing::warn!(error = %e, "retention sweep failed");
+            }
         }
     });
 }
@@ -146,4 +149,32 @@ pub async fn sweep_once(state: &AppState) -> crate::error::AppResult<usize> {
     }
 
     Ok(delivered)
+}
+
+/// Retention sweep: when retention is enabled (days > 0), soft-delete messages
+/// older than the configured threshold. Idempotent and safe to run every tick:
+/// it only touches rows not already soft-deleted. Returns the number newly
+/// soft-deleted. Public so integration tests can trigger it deterministically.
+pub async fn sweep_retention(state: &AppState) -> crate::error::AppResult<u64> {
+    let days = state.config.retention.days;
+    if days == 0 {
+        return Ok(0); // retention disabled
+    }
+
+    // Soft-delete rather than hard-delete, matching the app's normal delete
+    // semantics (deleted_at set; content preserved for integrity, hidden from
+    // clients). A dedicated GDPR hard-delete path is separate.
+    let cutoff_sql = format!("now() - interval '{days} days'");
+    let affected = sqlx::query(&format!(
+        "UPDATE messages SET deleted_at = now() \
+         WHERE deleted_at IS NULL AND created_at < {cutoff_sql}"
+    ))
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+
+    if affected > 0 {
+        tracing::info!(count = affected, days, "retention sweep soft-deleted messages");
+    }
+    Ok(affected)
 }

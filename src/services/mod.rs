@@ -1,6 +1,9 @@
 //! Business-logic services shared across handlers.
 
 pub mod access;
+pub mod audit;
+pub mod gdpr;
+pub mod mfa;
 pub mod email;
 pub mod events;
 pub mod notifications;

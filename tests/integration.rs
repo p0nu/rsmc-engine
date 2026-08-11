@@ -107,6 +107,8 @@ async fn test_settings() -> Option<(Settings, sqlx::PgPool)> {
             smtp_username: String::new(),
             smtp_password: String::new(),
         },
+        retention: rsmc_engine::config::RetentionConfig::default(),
+        gdpr: rsmc_engine::config::GdprConfig::default(),
     };
 
     // A pool scoped to this test's schema, so tests can make direct DB
@@ -967,6 +969,131 @@ async fn broadcast_mention_notifies_all_members() {
     assert_eq!(owner_mentions, 0, "author is not self-notified");
 }
 
+/// A member who turns OFF broadcast notifications via the notification-prefs
+/// endpoint receives no @channel broadcast notification, but a direct @you
+/// mention still reaches them (named mentions are always delivered). Also
+/// confirms /users/me and the update response echo the current preferences.
+#[tokio::test]
+async fn notification_prefs_suppress_broadcast_but_keep_named_mention() {
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    // Owner + one member.
+    let mut tokens = Vec::new();
+    let mut ids = Vec::new();
+    for (email, user) in [
+        ("owner@example.com", "owner"),
+        ("mem1@example.com", "memberone"),
+    ] {
+        let (_, b) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/signup",
+            None,
+            Some(json!({
+                "email": email, "username": user,
+                "display_name": user, "password": "supersecret"
+            })),
+        )
+        .await;
+        tokens.push(b["access_token"].as_str().unwrap().to_string());
+        ids.push(b["user"]["id"].as_str().unwrap().to_string());
+    }
+    let owner_token = &tokens[0];
+    let mem_token = &tokens[1];
+
+    // Signup response should carry default (all-true) prefs for the new user.
+    let (_, me_before) = send(&app, "GET", "/api/v1/users/me", Some(mem_token), None).await;
+    assert_eq!(me_before["notification_prefs"]["broadcast"], json!(true));
+    assert_eq!(me_before["notification_prefs"]["dm"], json!(true));
+
+    // Member turns OFF broadcast notifications; response echoes the new value.
+    let (status, updated) = send(
+        &app,
+        "PATCH",
+        "/api/v1/users/me/notification-prefs",
+        Some(mem_token),
+        Some(json!({ "broadcast": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["notification_prefs"]["broadcast"], json!(false));
+    // Other prefs are untouched by the partial update.
+    assert_eq!(updated["notification_prefs"]["thread_reply"], json!(true));
+    assert_eq!(updated["notification_prefs"]["dm"], json!(true));
+
+    // A channel with the member added.
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(owner_token),
+        Some(json!({ "name": "announce", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+    let (add_status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/members"),
+        Some(owner_token),
+        Some(json!({ "user_id": &ids[1] })),
+    )
+    .await;
+    assert_eq!(add_status, StatusCode::OK);
+
+    // Owner posts a broadcast: the member has broadcast OFF, so no broadcast
+    // notification should be created for them.
+    let (bstatus, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "@channel standup in 5" })),
+    )
+    .await;
+    assert_eq!(bstatus, StatusCode::OK);
+
+    // Owner posts a named mention: this always reaches the member.
+    let (mstatus, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(owner_token),
+        Some(json!({ "content": "hey @memberone can you look?" })),
+    )
+    .await;
+    assert_eq!(mstatus, StatusCode::OK);
+
+    let (_, notifs) = send(
+        &app,
+        "GET",
+        "/api/v1/notifications?unread_only=true&limit=50",
+        Some(mem_token),
+        None,
+    )
+    .await;
+    let arr = notifs.as_array().unwrap();
+    let broadcast_count = arr
+        .iter()
+        .filter(|n| {
+            n["kind"] == "mention" && n["payload"]["broadcast"] == serde_json::Value::Bool(true)
+        })
+        .count();
+    let named_count = arr
+        .iter()
+        .filter(|n| {
+            n["kind"] == "mention" && n["payload"]["broadcast"] != serde_json::Value::Bool(true)
+        })
+        .count();
+    assert_eq!(broadcast_count, 0, "broadcast suppressed by preference");
+    assert_eq!(named_count, 1, "named @mention still delivered");
+}
+
 /// Muting a channel suppresses notifications (including @channel broadcasts)
 /// for that member, while unread counts keep accruing.
 #[tokio::test]
@@ -1199,6 +1326,420 @@ async fn system_stats_reports_workspace_and_is_admin_only() {
     assert!(stats["server"]["version"].is_string());
     assert!(stats["database"]["size_bytes"].as_i64().unwrap() > 0);
     assert!(stats["realtime"]["online_users"].is_number());
+}
+
+/// The backup directory reported by /system/info must come from configuration
+/// (single source of truth), not a hardcoded container path. Regression guard
+/// for the old "/app/backups" constant that ignored config on bare-binary
+/// installs. Skips if a BACKUP_DIR env override is present (that would
+/// legitimately win over config).
+#[tokio::test]
+async fn system_info_backup_dir_comes_from_config() {
+    if std::env::var("APP__STORAGE__BACKUP_DIR").is_ok() || std::env::var("BACKUP_DIR").is_ok() {
+        eprintln!("skipping: backup dir env override is set");
+        return;
+    }
+    let Some((settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let expected = settings.storage.backup_dir.clone();
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, admin) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "binfo@example.com", "username": "binfo",
+            "display_name": "BInfo", "password": "supersecret"
+        })),
+    )
+    .await;
+    let admin_token = admin["access_token"].as_str().unwrap();
+
+    let (status, info) = send(&app, "GET", "/api/v1/system/info", Some(admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    // The reported dir must equal the configured value, and must not be the old
+    // hardcoded container path.
+    assert_eq!(info["backup_dir"], json!(expected));
+    assert_ne!(info["backup_dir"], json!("/app/backups"));
+}
+
+/// Retention sweep soft-deletes messages older than the configured threshold
+/// and leaves recent ones untouched. Disabled (days=0) is a no-op.
+#[tokio::test]
+async fn retention_sweep_soft_deletes_old_messages() {
+    let Some((mut settings, pool)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    settings.retention = rsmc_engine::config::RetentionConfig { days: 30 };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state.clone());
+
+    // One user, one channel, two messages.
+    let (token, _uid) = signup(&app, "ret@example.com", "retuser").await;
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&token),
+        Some(json!({ "name": "retention", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap();
+
+    // Recent message (stays).
+    let (_, recent) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "recent" })),
+    )
+    .await;
+    let recent_id = recent["id"].as_str().unwrap();
+
+    // Old message (should be swept). Insert directly and backdate created_at.
+    let old_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO messages (id, channel_id, user_id, content, created_at) \
+         SELECT $1, $2, user_id, 'ancient', now() - interval '60 days' \
+         FROM messages WHERE id = $3",
+    )
+    .bind(old_id)
+    .bind(uuid::Uuid::parse_str(ch_id).unwrap())
+    .bind(uuid::Uuid::parse_str(recent_id).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run the sweep.
+    let swept = rsmc_engine::services::scheduler::sweep_retention(&state)
+        .await
+        .unwrap();
+    assert!(swept >= 1, "at least the old message should be swept");
+
+    // Old message is soft-deleted; recent one is not.
+    let old_deleted: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM messages WHERE id = $1")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(old_deleted.is_some(), "old message soft-deleted");
+
+    let recent_deleted: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM messages WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(recent_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(recent_deleted.is_none(), "recent message untouched");
+}
+
+/// Active-session management: sessions are listed with device info, can be
+/// revoked individually, and a revoked session's refresh token stops working.
+#[tokio::test]
+async fn sessions_list_and_revoke() {
+    let Some((settings, _pool)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    // Signup creates session #1.
+    let (_, s1) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "sess@example.com", "username": "sessuser",
+            "display_name": "Sess", "password": "supersecret"
+        })),
+    )
+    .await;
+    let token1 = s1["access_token"].as_str().unwrap().to_string();
+
+    // Login creates session #2.
+    let (_, s2) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(json!({ "email": "sess@example.com", "password": "supersecret" })),
+    )
+    .await;
+    let refresh2 = s2["refresh_token"].as_str().unwrap().to_string();
+
+    // List: expect at least 2 active sessions.
+    let (status, list) = send(&app, "GET", "/api/v1/users/me/sessions", Some(&token1), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let sessions = list["sessions"].as_array().unwrap();
+    assert!(sessions.len() >= 2, "two sessions expected, got {}", sessions.len());
+
+    // Find session #2's id (the one whose refresh token we hold). We can't map
+    // token->id directly, so revoke the newest and confirm refresh2 breaks.
+    // Instead: revoke ALL others is cleaner to assert. Revoke every session,
+    // then the second refresh token must be rejected.
+    let (rstatus, _) = send(
+        &app,
+        "POST",
+        "/api/v1/users/me/sessions/revoke-all",
+        Some(&token1),
+        None,
+    )
+    .await;
+    assert_eq!(rstatus, StatusCode::OK);
+
+    // refresh2 should now be rejected (session revoked).
+    let (refresh_status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/refresh",
+        None,
+        Some(json!({ "refresh_token": refresh2 })),
+    )
+    .await;
+    assert_eq!(
+        refresh_status,
+        StatusCode::UNAUTHORIZED,
+        "revoked session's refresh token must be rejected"
+    );
+
+    // Listing again shows no active sessions.
+    let (_, list2) = send(&app, "GET", "/api/v1/users/me/sessions", Some(&token1), None).await;
+    assert_eq!(list2["sessions"].as_array().unwrap().len(), 0);
+}
+
+/// Full MFA lifecycle: enroll -> confirm -> login returns challenge ->
+/// verify with a real TOTP code issues tokens. Also checks a wrong code fails.
+#[tokio::test]
+async fn mfa_totp_enroll_and_login() {
+    let Some((settings, _pool)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    let jwt_secret = settings.auth.jwt_secret.clone();
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (_, s) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/signup",
+        None,
+        Some(json!({
+            "email": "mfa@example.com", "username": "mfauser",
+            "display_name": "MFA", "password": "supersecret"
+        })),
+    )
+    .await;
+    let token = s["access_token"].as_str().unwrap().to_string();
+
+    // Enroll: get the secret.
+    let (status, enroll) = send(
+        &app,
+        "POST",
+        "/api/v1/users/me/mfa/enroll",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let b32 = enroll["secret_base32"].as_str().unwrap();
+    let secret = data_encoding::BASE32_NOPAD.decode(b32.as_bytes()).unwrap();
+
+    // Compute a valid current code and confirm.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let code = format!("{:06}", rsmc_engine::services::mfa::totp_for_test(&secret, now));
+    let (cstatus, _) = send(
+        &app,
+        "POST",
+        "/api/v1/users/me/mfa/confirm",
+        Some(&token),
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(cstatus, StatusCode::OK);
+
+    // Login now returns a challenge, not tokens.
+    let (lstatus, login) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(json!({ "email": "mfa@example.com", "password": "supersecret" })),
+    )
+    .await;
+    assert_eq!(lstatus, StatusCode::OK);
+    assert_eq!(login["mfa_required"], json!(true));
+    assert!(login["access_token"].is_null(), "no tokens before MFA");
+    let mfa_token = login["mfa_token"].as_str().unwrap().to_string();
+
+    // Wrong code rejected.
+    let (wstatus, _) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/mfa/verify",
+        None,
+        Some(json!({ "mfa_token": mfa_token, "code": "000000" })),
+    )
+    .await;
+    assert_eq!(wstatus, StatusCode::UNAUTHORIZED);
+
+    // Correct code completes login.
+    let code2 = format!(
+        "{:06}",
+        rsmc_engine::services::mfa::totp_for_test(&secret, now)
+    );
+    let (vstatus, verify) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/mfa/verify",
+        None,
+        Some(json!({ "mfa_token": mfa_token, "code": code2 })),
+    )
+    .await;
+    assert_eq!(vstatus, StatusCode::OK);
+    assert!(verify["access_token"].as_str().is_some(), "tokens issued after MFA");
+
+    // jwt_secret is unused directly but kept to show the secret is decryptable.
+    let _ = jwt_secret;
+}
+
+/// GDPR export returns the user's messages; anonymize scrubs identity but keeps
+/// the message; hard-delete removes the user and their messages.
+#[tokio::test]
+async fn gdpr_export_and_deletion_modes() {
+    use rsmc_engine::config::{DeletionMode, GdprConfig};
+
+    // --- Anonymize mode (default) ---
+    let Some((mut settings, pool)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    settings.gdpr = GdprConfig {
+        deletion_mode: DeletionMode::Anonymize,
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state.clone());
+
+    let (token, uid) = signup(&app, "gdpr1@example.com", "gdpruser").await;
+    let (_, ch) = send(
+        &app,
+        "POST",
+        "/api/v1/channels",
+        Some(&token),
+        Some(json!({ "name": "gdpr", "private": false })),
+    )
+    .await;
+    let ch_id = ch["id"].as_str().unwrap();
+    let (_, msg) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{ch_id}/messages"),
+        Some(&token),
+        Some(json!({ "content": "my personal message" })),
+    )
+    .await;
+    let msg_id = msg["id"].as_str().unwrap().to_string();
+
+    // Export includes the message.
+    let (estatus, export) = send(&app, "GET", "/api/v1/users/me/export", Some(&token), None).await;
+    assert_eq!(estatus, StatusCode::OK);
+    let msgs = export["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter().any(|m| m["content"] == "my personal message"),
+        "export should contain the user's message"
+    );
+
+    // Anonymize deletion.
+    let (dstatus, _) = send(&app, "DELETE", "/api/v1/users/me", Some(&token), None).await;
+    assert_eq!(dstatus, StatusCode::OK);
+
+    // Identity scrubbed, but the message row still exists.
+    let uid_parsed = uuid::Uuid::parse_str(&uid).unwrap();
+    let (display, active): (String, bool) =
+        sqlx::query_as("SELECT display_name, is_active FROM users WHERE id = $1")
+            .bind(uid_parsed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(display, "Deleted User");
+    assert!(!active);
+    let msg_exists: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messages WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&msg_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(msg_exists, 1, "anonymize keeps the message");
+
+    // --- Hard-delete mode (separate user, no owned channels) ---
+    let (mut s2, pool2) = test_settings().await.unwrap();
+    s2.gdpr = GdprConfig {
+        deletion_mode: DeletionMode::HardDelete,
+    };
+    let state2 = rsmc_engine::bootstrap(s2).await.unwrap();
+    let app2 = rsmc_engine::build_router(state2);
+
+    // First user is admin and will own the channel; second user just posts.
+    let (at, _admin_id) = signup(&app2, "owner@example.com", "owner2").await;
+    let (_, ch2) = send(
+        &app2,
+        "POST",
+        "/api/v1/channels",
+        Some(&at),
+        Some(json!({ "name": "shared", "private": false })),
+    )
+    .await;
+    let ch2_id = ch2["id"].as_str().unwrap();
+
+    let (ut, uid2) = signup(&app2, "gdpr2@example.com", "harduser").await;
+    // Join and post as the second user.
+    send(
+        &app2,
+        "POST",
+        &format!("/api/v1/channels/{ch2_id}/join"),
+        Some(&ut),
+        None,
+    )
+    .await;
+    let (_, m2) = send(
+        &app2,
+        "POST",
+        &format!("/api/v1/channels/{ch2_id}/messages"),
+        Some(&ut),
+        Some(json!({ "content": "erase me" })),
+    )
+    .await;
+    let m2_id = m2["id"].as_str().unwrap().to_string();
+
+    let (d2, _) = send(&app2, "DELETE", "/api/v1/users/me", Some(&ut), None).await;
+    assert_eq!(d2, StatusCode::OK);
+
+    // User row gone, message gone.
+    let user_exists: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&uid2).unwrap())
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+    assert_eq!(user_exists, 0, "hard-delete removes the user");
+    let msg_gone: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&m2_id).unwrap())
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+    assert_eq!(msg_gone, 0, "hard-delete removes the user's messages");
 }
 
 // ===========================================================================
@@ -1839,6 +2380,54 @@ async fn rate_limiting_disabled_lets_everything_through() {
         let (status, _) = send(&app, "POST", "/api/v1/auth/login", None, Some(creds.clone())).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "no request should be rate-limited when disabled");
     }
+}
+
+#[tokio::test]
+async fn read_requests_are_exempt_from_write_limit() {
+    let Some((mut settings, _admin)) = test_settings().await else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return;
+    };
+    // Very tight write budget so the exemption is observable.
+    settings.rate_limit = RateLimitConfig {
+        enabled: true,
+        auth_max: 1000,
+        auth_window_secs: 300,
+        write_max: 3,
+        write_window_secs: 300,
+    };
+    let state = rsmc_engine::bootstrap(settings).await.unwrap();
+    let app = rsmc_engine::build_router(state);
+
+    let (token, _uid) = signup(&app, "reader@example.com", "reader").await;
+
+    // Many GETs must all succeed despite write_max = 3: reads are exempt.
+    for i in 0..15 {
+        let (status, _) = send(&app, "GET", "/api/v1/users/me", Some(&token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET #{i} should not be rate-limited (reads are exempt)"
+        );
+    }
+
+    // Writes still count: repeated status PUTs eventually hit the limit.
+    let mut hit_limit = false;
+    for _ in 0..8 {
+        let (status, _) = send(
+            &app,
+            "PUT",
+            "/api/v1/users/me/status",
+            Some(&token),
+            Some(json!({ "text": "busy" })),
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            hit_limit = true;
+            break;
+        }
+    }
+    assert!(hit_limit, "writes should still be limited by write_max");
 }
 
 // ===========================================================================

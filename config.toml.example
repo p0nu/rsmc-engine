@@ -46,3 +46,17 @@ max_file_bytes = 26214400         # 25 MiB
 [logging]
 format = "text"   # "text" for human-readable, "json" for structured logs
 level = "info"    # error | warn | info | debug | trace
+
+[retention]
+# Message retention. When days > 0, a background sweep soft-deletes messages
+# older than that many days. 0 (the default) keeps messages forever.
+days = 0
+
+[gdpr]
+# Behavior of account deletion (DELETE /users/me):
+#   "anonymize"   - scrub the user to a tombstone but keep their messages, so
+#                   threads and history stay intact (default, recommended).
+#   "hard_delete" - remove the user and their messages. Blocked with a clear
+#                   error if the user owns channels (reassign or delete those
+#                   first). Leaves gaps in others' threads by nature.
+deletion_mode = "anonymize"

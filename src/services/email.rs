@@ -116,19 +116,31 @@ pub fn action_link(cfg: &EmailConfig, path: &str, token: &str) -> String {
 }
 
 mod smtp {
-    //! Minimal SMTP submission over TCP with STARTTLS. Intentionally small; for
-    //! exotic servers, front RSMC with a relay. Errors are surfaced so callers
-    //! can log a clear failure.
+    //! Minimal SMTP submission with a real STARTTLS upgrade.
+    //!
+    //! Flow: connect in plaintext, EHLO, issue STARTTLS, then perform an actual
+    //! TLS handshake with tokio-rustls and carry out AUTH + the mail transaction
+    //! over the encrypted stream. Credentials and message data are never sent on
+    //! the plaintext socket. Uses Mozilla's webpki roots for server-cert
+    //! verification. For servers that speak implicit TLS on port 465 or that do
+    //! not offer STARTTLS, front RSMC with a submission relay.
     use super::{Mail, SmtpTransport};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio_rustls::rustls::{self, pki_types::ServerName};
+    use tokio_rustls::TlsConnector;
 
     async fn read_reply(stream: &mut (impl AsyncReadExt + Unpin)) -> anyhow::Result<String> {
-        let mut buf = vec![0u8; 1024];
+        let mut buf = vec![0u8; 2048];
         let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            anyhow::bail!("SMTP connection closed unexpectedly");
+        }
         Ok(String::from_utf8_lossy(&buf[..n]).to_string())
     }
 
+    /// Send a command line and return the server's reply.
     async fn cmd(
         stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
         line: &str,
@@ -138,51 +150,99 @@ mod smtp {
         read_reply(stream).await
     }
 
-    pub async fn send(t: &SmtpTransport, mail: Mail) -> anyhow::Result<()> {
-        // Plain connection for the initial handshake; upgrade with STARTTLS.
-        let mut stream = TcpStream::connect((t.host.as_str(), t.port)).await?;
-        let _greeting = read_reply(&mut stream).await?;
-        let _ehlo = cmd(&mut stream, &format!("EHLO {}", "rsmc")).await?;
-
-        // Many submission servers require STARTTLS. We attempt it; if the server
-        // does not advertise it, the AUTH/MAIL still proceed on the plain socket
-        // (acceptable for a trusted internal relay). A full TLS upgrade uses
-        // tokio-rustls; kept minimal here.
-        let starttls = cmd(&mut stream, "STARTTLS").await?;
-        if !starttls.starts_with("220") {
-            tracing::warn!("SMTP server did not accept STARTTLS; sending on plain connection");
-        }
-
-        // AUTH LOGIN (base64 username/password) when credentials are set.
-        if !t.username.is_empty() {
-            let _ = cmd(&mut stream, "AUTH LOGIN").await?;
-            let _ = cmd(
-                &mut stream,
-                &base64_encode(t.username.as_bytes()),
-            )
-            .await?;
-            let _ = cmd(
-                &mut stream,
-                &base64_encode(t.password.as_bytes()),
-            )
-            .await?;
-        }
-
-        let _ = cmd(&mut stream, &format!("MAIL FROM:<{}>", t.from)).await?;
-        let _ = cmd(&mut stream, &format!("RCPT TO:<{}>", mail.to)).await?;
-        let _ = cmd(&mut stream, "DATA").await?;
-        let msg = format!(
-            "From: {}\r\nTo: {}\r\nSubject: {}\r\n\r\n{}\r\n.",
-            t.from, mail.to, mail.subject, mail.body
-        );
-        let resp = cmd(&mut stream, &msg).await?;
-        let _ = cmd(&mut stream, "QUIT").await?;
-
-        if resp.starts_with('2') || resp.contains("250") {
+    /// Assert that a reply begins with the expected 3-digit code, else error.
+    fn expect(reply: &str, code: &str, step: &str) -> anyhow::Result<()> {
+        if reply.starts_with(code) {
             Ok(())
         } else {
-            anyhow::bail!("SMTP delivery failed: {resp}")
+            anyhow::bail!("SMTP {step} failed: expected {code}, got {}", reply.trim())
         }
+    }
+
+    /// Build a rustls client config trusting the Mozilla root set.
+    ///
+    /// Uses the ring provider explicitly rather than the process-default
+    /// provider: RSMC never calls CryptoProvider::install_default, so relying on
+    /// the default would risk a runtime panic ("no process-level CryptoProvider
+    /// available"). Being explicit keeps SMTP self-contained.
+    fn tls_config() -> anyhow::Result<Arc<rustls::ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("rustls provider setup failed: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
+    /// Run the AUTH + mail transaction over any (post-TLS) stream.
+    async fn transact(
+        stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
+        t: &SmtpTransport,
+        mail: &Mail,
+    ) -> anyhow::Result<()> {
+        // Re-EHLO over the encrypted channel (required by the protocol after
+        // STARTTLS; the server re-advertises capabilities).
+        let ehlo = cmd(stream, "EHLO rsmc").await?;
+        expect(&ehlo, "250", "EHLO(tls)")?;
+
+        // AUTH LOGIN when credentials are configured.
+        if !t.username.is_empty() {
+            let a = cmd(stream, "AUTH LOGIN").await?;
+            expect(&a, "334", "AUTH LOGIN")?;
+            let u = cmd(stream, &base64_encode(t.username.as_bytes())).await?;
+            expect(&u, "334", "AUTH username")?;
+            let p = cmd(stream, &base64_encode(t.password.as_bytes())).await?;
+            expect(&p, "235", "AUTH password")?;
+        }
+
+        let mf = cmd(stream, &format!("MAIL FROM:<{}>", t.from)).await?;
+        expect(&mf, "250", "MAIL FROM")?;
+        let rc = cmd(stream, &format!("RCPT TO:<{}>", mail.to)).await?;
+        // 250 or 251 are both acceptable for RCPT.
+        if !(rc.starts_with("250") || rc.starts_with("251")) {
+            anyhow::bail!("SMTP RCPT TO failed: {}", rc.trim());
+        }
+        let d = cmd(stream, "DATA").await?;
+        expect(&d, "354", "DATA")?;
+
+        // Body, dot-stuffed terminator on its own line.
+        let msg = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n.",
+            t.from, mail.to, mail.subject, mail.body
+        );
+        let resp = cmd(stream, &msg).await?;
+        expect(&resp, "250", "message body")?;
+
+        let _ = cmd(stream, "QUIT").await;
+        Ok(())
+    }
+
+    pub async fn send(t: &SmtpTransport, mail: Mail) -> anyhow::Result<()> {
+        // 1. Plaintext connect + greeting + EHLO.
+        let mut plain = TcpStream::connect((t.host.as_str(), t.port)).await?;
+        let greeting = read_reply(&mut plain).await?;
+        expect(&greeting, "220", "greeting")?;
+        let ehlo = cmd(&mut plain, "EHLO rsmc").await?;
+        expect(&ehlo, "250", "EHLO")?;
+
+        // 2. STARTTLS: the server must agree with 220 before we hand over any
+        //    credentials. If it will not, we refuse rather than fall back to
+        //    plaintext auth (that was the old bug).
+        let starttls = cmd(&mut plain, "STARTTLS").await?;
+        expect(&starttls, "220", "STARTTLS")?;
+
+        // 3. Real TLS handshake over the same socket.
+        let connector = TlsConnector::from(tls_config()?);
+        let server_name = ServerName::try_from(t.host.clone())
+            .map_err(|_| anyhow::anyhow!("invalid SMTP host name for TLS: {}", t.host))?;
+        let mut tls = connector.connect(server_name, plain).await?;
+
+        // 4. AUTH + mail transaction, entirely over TLS.
+        transact(&mut tls, t, &mail).await
     }
 
     /// Small base64 (standard alphabet) for AUTH LOGIN, avoids a new dep.
@@ -209,5 +269,51 @@ mod smtp {
             }
         }
         out
+    }
+
+    /// Test-only accessor for the base64 helper.
+    #[cfg(test)]
+    pub(super) fn b64_for_test(input: &[u8]) -> String {
+        base64_encode(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 test vectors.
+        assert_eq!(smtp::b64_for_test(b""), "");
+        assert_eq!(smtp::b64_for_test(b"f"), "Zg==");
+        assert_eq!(smtp::b64_for_test(b"fo"), "Zm8=");
+        assert_eq!(smtp::b64_for_test(b"foo"), "Zm9v");
+        assert_eq!(smtp::b64_for_test(b"foob"), "Zm9vYg==");
+        assert_eq!(smtp::b64_for_test(b"fooba"), "Zm9vYmE=");
+        assert_eq!(smtp::b64_for_test(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn transport_selection_follows_config() {
+        let mut cfg = EmailConfig::default();
+        // No SMTP host -> console transport.
+        cfg.smtp_host = String::new();
+        assert!(!cfg.smtp_enabled());
+        // With a host -> SMTP enabled.
+        cfg.smtp_host = "smtp.example.com".into();
+        assert!(cfg.smtp_enabled());
+    }
+
+    #[test]
+    fn action_link_composition() {
+        let mut cfg = EmailConfig::default();
+        cfg.public_base_url = "https://chat.example.com/".into();
+        let link = action_link(&cfg, "/verify-email", "abc123");
+        assert_eq!(link, "https://chat.example.com/verify-email?token=abc123");
+        // Empty base falls back to a relative link.
+        cfg.public_base_url = String::new();
+        let rel = action_link(&cfg, "/verify-email", "abc123");
+        assert_eq!(rel, "/verify-email?token=abc123");
     }
 }

@@ -14,9 +14,6 @@ use crate::error::{AppError, AppResult};
 use crate::middleware::AdminUser;
 use crate::state::AppState;
 
-/// Default directory backups live in when the admin gives a bare filename.
-const DEFAULT_BACKUP_DIR: &str = "/app/backups";
-
 #[derive(Debug, Deserialize)]
 pub struct BackupRequest {
     /// Optional dump path or filename. Omitted = timestamped name; bare
@@ -49,18 +46,21 @@ pub struct BackupEntry {
     pub modified_at: String,
 }
 
-/// Resolve the directory used for backups, honoring an env override.
-fn backup_dir() -> PathBuf {
+/// Resolve the directory used for backups. An explicit environment override
+/// wins; otherwise the configured storage.backup_dir is the single source of
+/// truth (default "./backups"). This keeps the effective-configuration log and
+/// the actual write location in agreement on a bare-binary install.
+fn backup_dir(state: &AppState) -> PathBuf {
     std::env::var("APP__STORAGE__BACKUP_DIR")
         .or_else(|_| std::env::var("BACKUP_DIR"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_BACKUP_DIR))
+        .unwrap_or_else(|_| PathBuf::from(&state.config.storage.backup_dir))
 }
 
 /// Resolve a user-supplied path/filename to a constrained path: bare filename
 /// goes in the backups dir; absolute paths must live under it.
-fn resolve_target(input: Option<String>) -> AppResult<PathBuf> {
-    let dir = backup_dir();
+fn resolve_target(state: &AppState, input: Option<String>) -> AppResult<PathBuf> {
+    let dir = backup_dir(state);
     let raw = input
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -103,7 +103,7 @@ pub async fn backup(
     body: Option<Json<BackupRequest>>,
 ) -> AppResult<Json<BackupResponse>> {
     let req = body.map(|Json(b)| b).unwrap_or(BackupRequest { path: None });
-    let target = resolve_target(req.path)?;
+    let target = resolve_target(&state, req.path)?;
 
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
@@ -196,10 +196,10 @@ pub async fn restore(
 
 /// GET /api/v1/system/backups - list dumps in the backups directory.
 pub async fn list_backups(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     AdminUser(_admin): AdminUser,
 ) -> AppResult<Json<Vec<BackupEntry>>> {
-    let dir = backup_dir();
+    let dir = backup_dir(&state);
     let mut entries = Vec::new();
 
     let mut rd = match tokio::fs::read_dir(&dir).await {
@@ -238,10 +238,10 @@ pub async fn list_backups(
 
 /// GET /api/v1/system/info - surface the backup directory and tool availability.
 pub async fn info(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     AdminUser(_admin): AdminUser,
 ) -> AppResult<Json<serde_json::Value>> {
-    let dir = backup_dir();
+    let dir = backup_dir(&state);
     let pg_dump = which("pg_dump").await;
     let pg_restore = which("pg_restore").await;
     Ok(Json(json!({
@@ -367,4 +367,52 @@ pub async fn stats(
             "redis_enabled": state.config.redis.url.is_some(),
         },
     })))
+}
+
+/// GET /api/v1/system/audit - list recent audit events (admin only).
+///
+/// Supports `limit` (default 50, max 200) and an optional `action` filter.
+/// Returns newest first.
+pub async fn audit_log(
+    State(state): State<AppState>,
+    AdminUser(_admin): AdminUser,
+    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+
+    let rows = sqlx::query_as::<_, AuditRow>(
+        r#"
+        SELECT id, action, actor_id, actor_label, target_kind, target_id,
+               target_label, metadata, created_at
+        FROM audit_events
+        WHERE ($1::text IS NULL OR action = $1)
+        ORDER BY created_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(q.action.as_deref())
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({ "events": rows })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AuditQuery {
+    pub limit: Option<i64>,
+    pub action: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+struct AuditRow {
+    id: uuid::Uuid,
+    action: String,
+    actor_id: Option<uuid::Uuid>,
+    actor_label: String,
+    target_kind: Option<String>,
+    target_id: Option<String>,
+    target_label: Option<String>,
+    metadata: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
 }

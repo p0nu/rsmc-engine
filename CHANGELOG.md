@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.10.0] - MFA, GDPR, sessions, audit, retention, metrics, and real SMTP
+
+### Added
+- **MFA (TOTP, RFC 6238).** Authenticator-app two-factor. Two-step enrollment
+  (`POST /users/me/mfa/enroll` then `/confirm`), a short-lived challenge issued
+  at login when MFA is enabled (exchanged at `POST /auth/mfa/verify`), and
+  `/disable` requiring a current code. Secrets are stored encrypted at rest
+  (AES-256-GCM). New additive migration (0012). Implemented from primitives
+  already in the tree (hmac, sha1, data-encoding, ring), no new crates. Note:
+  authenticator apps only, no backup codes or email fallback in this release.
+- **GDPR data export and account deletion.** `GET /users/me/export` returns the
+  caller's profile, messages, memberships, and sessions as JSON. `DELETE
+  /users/me` follows an instance policy (`gdpr.deletion_mode`): `anonymize`
+  (default) tombstones the user but keeps messages for thread integrity, or
+  `hard_delete` removes the user and their messages (blocked with a clear error
+  if the user owns channels). Config-only, no migration.
+- **Active session management.** `GET /users/me/sessions` lists a user's refresh
+  sessions with a device label and last-used time; `DELETE
+  /users/me/sessions/:id` and `POST /users/me/sessions/revoke-all` revoke them.
+  No IP addresses are stored (privacy-minimizing). New additive migration (0011).
+- **Admin audit log.** Append-only recording of security-relevant admin actions
+  (role changes, activate/deactivate, MFA enable/disable, account deletion),
+  readable at `GET /system/audit`. New additive migration (0010). Writes are
+  best-effort and never block the primary operation.
+- **Message retention.** Optional config `retention.days` (0 = disabled); the
+  scheduler soft-deletes messages older than the threshold. Config-only.
+- **Prometheus metrics.** Dependency-free `GET /metrics` exposition of aggregate
+  gauges, unauthenticated for scraping.
+- **Notification preferences.** Per-user toggles for broadcast mentions, thread
+  replies, and DMs (named @mentions always notify). New additive migration
+  (0009), surfaced on the user object.
+
+### Changed
+- **Real SMTP over STARTTLS.** The SMTP transport now performs an actual TLS
+  upgrade (via tokio-rustls, already in the tree) before sending credentials or
+  message data, and refuses to send if the server will not STARTTLS. Fixes a bug
+  where auth could be sent on a plaintext connection. No new crates.
+- **`mfa_enabled` on the self user.** `GET /users/me` now reports the caller's
+  MFA state so clients can render enable/disable correctly.
+
+### Fixed
+- **Read requests exempt from the write rate limit.** GET/HEAD/OPTIONS no longer
+  count against the per-user write budget, fixing spurious "could not load
+  messages" errors during normal use. Only mutations are limited.
+- **Backup directory from config.** The backup path is read from
+  `storage.backup_dir` (default `./backups`) as the single source of truth
+  instead of a hardcoded container path.
+
+### Notes
+- Twelve migrations frozen (0001-0012); all 0.10.0 additions are additive.
+- Review items for sign-off before 1.0: the MFA secret encryption key is derived
+  from `JWT_SECRET` (rotating it invalidates enrolled TOTP secrets); GDPR
+  hard-delete leaves gaps in others' threads by design (anonymize is the default
+  for integrity).
+
 ## [0.9.0] - email flows, bare-binary defaults, and startup diagnostics
 
 ### Added

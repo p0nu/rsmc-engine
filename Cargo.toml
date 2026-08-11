@@ -1,6 +1,6 @@
 [package]
 name = "rsmc-engine"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["RSMC Engine Contributors"]
 description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"
@@ -53,6 +53,15 @@ rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 
+# TOTP (RFC 6238) primitives. All already present transitively, so promoting
+# them to direct deps adds no new crates and avoids heavier TOTP crates that
+# risk edition2024 deps under Rust 1.75.
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
+# AES-256-GCM for encrypting TOTP secrets at rest (already in tree via rustls).
+ring = "0.17"
+
 # Redis pub/sub (optional scaling)
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"], optional = true }
 
@@ -76,6 +85,15 @@ validator = { version = "0.18", features = ["derive"] }
 
 # HTTP client for webhooks
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# TLS for the SMTP STARTTLS upgrade. These are already present transitively
+# (via sqlx/reqwest rustls), so promoting them to direct deps adds no new
+# crates to the lock and keeps us clear of the edition2024 dependency issues
+# that block the lettre crate under Rust 1.75.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "=0.26.11"
+rustls-pki-types = "1"
+
 
 # Utilities
 futures = "0.3"

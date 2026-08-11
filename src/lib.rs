@@ -42,6 +42,7 @@ pub fn build_router(state: AppState) -> Router {
     let auth_routes = Router::new()
         .route("/auth/signup", post(handlers::auth::signup))
         .route("/auth/login", post(handlers::auth::login))
+        .route("/auth/mfa/verify", post(handlers::auth::mfa_verify))
         .route("/auth/refresh", post(handlers::auth::refresh))
         .route("/auth/logout", post(handlers::auth::logout))
         .route("/auth/verify-email", post(handlers::email::verify_email))
@@ -67,9 +68,37 @@ pub fn build_router(state: AppState) -> Router {
         // ---- users ----
         .route(
             "/users/me",
-            get(handlers::users::me).patch(handlers::users::update_me),
+            get(handlers::users::me)
+                .patch(handlers::users::update_me)
+                .delete(handlers::users::delete_my_account),
         )
         .route("/users/me/status", put(handlers::users::set_status))
+        .route(
+            "/users/me/notification-prefs",
+            patch(handlers::users::update_notification_prefs),
+        )
+        .route("/users/me/sessions", get(handlers::users::list_sessions))
+        .route("/users/me/export", get(handlers::users::export_my_data))
+        .route(
+            "/users/me/mfa/enroll",
+            post(handlers::users::mfa_enroll),
+        )
+        .route(
+            "/users/me/mfa/confirm",
+            post(handlers::users::mfa_confirm),
+        )
+        .route(
+            "/users/me/mfa/disable",
+            post(handlers::users::mfa_disable),
+        )
+        .route(
+            "/users/me/sessions/revoke-all",
+            post(handlers::users::revoke_all_sessions),
+        )
+        .route(
+            "/users/me/sessions/:id",
+            delete(handlers::users::revoke_session),
+        )
         .route(
             "/users/me/verify-email",
             post(handlers::email::send_verification),
@@ -199,6 +228,7 @@ pub fn build_router(state: AppState) -> Router {
         // ---- system (admin) ----
         .route("/system/info", get(handlers::system::info))
         .route("/system/stats", get(handlers::system::stats))
+        .route("/system/audit", get(handlers::system::audit_log))
         .route("/system/backup", post(handlers::system::backup))
         .route("/system/backups", get(handlers::system::list_backups))
         .route("/system/restore", post(handlers::system::restore))
@@ -223,6 +253,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/readyz", get(handlers::health::readyz))
+        .route("/metrics", get(handlers::metrics::metrics))
         .nest("/api/v1", api)
         .layer(TraceLayer::new_for_http())
         // Raise both body limits: RequestBodyLimitLayer caps the raw body,

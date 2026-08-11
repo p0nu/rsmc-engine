@@ -130,6 +130,8 @@ fn placeholder_user(id: Uuid) -> UserPublic {
         status_text: None,
         status_expires_at: None,
         email_verified: None,
+        notification_prefs: None,
+        mfa_enabled: None,
     }
 }
 
@@ -269,8 +271,10 @@ async fn dispatch_notifications(
         {
             if ctype == "direct" {
                 if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
-                    "SELECT user_id FROM channel_members \
-                     WHERE channel_id = $1 AND user_id <> $2 AND NOT muted",
+                    "SELECT cm.user_id FROM channel_members cm \
+                     JOIN users u ON u.id = cm.user_id \
+                     WHERE cm.channel_id = $1 AND cm.user_id <> $2 \
+                       AND NOT cm.muted AND u.notify_dm",
                 )
                 .bind(channel_id)
                 .bind(view.message.user_id)
@@ -301,7 +305,8 @@ async fn dispatch_notifications(
         if let Ok(Some(author)) = sqlx::query_scalar::<_, Uuid>(
             "SELECT m.user_id FROM messages m \
              JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = m.user_id \
-             WHERE m.id = $1 AND NOT cm.muted",
+             JOIN users u ON u.id = m.user_id \
+             WHERE m.id = $1 AND NOT cm.muted AND u.notify_thread_reply",
         )
         .bind(parent)
         .fetch_optional(&state.db)
@@ -373,8 +378,10 @@ async fn dispatch_notifications(
 
         if !is_direct {
             if let Ok(members) = sqlx::query_scalar::<_, Uuid>(
-                "SELECT user_id FROM channel_members \
-                 WHERE channel_id = $1 AND user_id <> $2 AND NOT muted",
+                "SELECT cm.user_id FROM channel_members cm \
+                 JOIN users u ON u.id = cm.user_id \
+                 WHERE cm.channel_id = $1 AND cm.user_id <> $2 \
+                   AND NOT cm.muted AND u.notify_broadcast",
             )
             .bind(channel_id)
             .bind(view.message.user_id)

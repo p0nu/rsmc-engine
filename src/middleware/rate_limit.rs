@@ -92,6 +92,18 @@ pub async fn write_limit(
         return next.run(req).await;
     }
 
+    // Only mutating requests count against the write/flood budget. Read-only
+    // methods (GET/HEAD/OPTIONS) are exempt: a single screen load fires many
+    // GETs (channels, messages, members, notifications), and throttling those
+    // would surface as spurious "could not load" errors during normal use.
+    let method = req.method();
+    if method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
+        || method == axum::http::Method::OPTIONS
+    {
+        return next.run(req).await;
+    }
+
     // Try to resolve a user id from the bearer token (cheap: JWT verify only).
     let uid = req
         .headers()

@@ -84,6 +84,22 @@ pub struct User {
     #[serde(default)]
     #[sqlx(default)]
     pub status_expires_at: Option<DateTime<Utc>>,
+    /// Per-user notification preferences (0.10.0). `#[sqlx(default)]` keeps
+    /// queries that omit these columns working, and each defaults to the
+    /// permissive value so behavior is unchanged until a user opts out.
+    #[serde(default = "default_true")]
+    #[sqlx(default)]
+    pub notify_broadcast: bool,
+    #[serde(default = "default_true")]
+    #[sqlx(default)]
+    pub notify_thread_reply: bool,
+    #[serde(default = "default_true")]
+    #[sqlx(default)]
+    pub notify_dm: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl User {
@@ -115,8 +131,39 @@ impl User {
             status_text,
             status_expires_at,
             email_verified: None,
+            notification_prefs: None,
+            mfa_enabled: None,
         }
     }
+
+    /// The caller's own notification preferences, as a small struct. Attached
+    /// only to self endpoints (never exposed for other users).
+    pub fn notification_prefs(&self) -> NotificationPrefs {
+        NotificationPrefs {
+            broadcast: self.notify_broadcast,
+            thread_reply: self.notify_thread_reply,
+            dm: self.notify_dm,
+        }
+    }
+}
+
+/// Per-user notification preferences. Each flag, when false, suppresses the
+/// corresponding notification type for this user. Named @you mentions are
+/// intentionally not represented here: personal pings are always delivered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NotificationPrefs {
+    pub broadcast: bool,
+    pub thread_reply: bool,
+    pub dm: bool,
+}
+
+/// Body for `PATCH /users/me/notification-prefs`. All fields optional so a
+/// client can update a single toggle; omitted fields are left unchanged.
+#[derive(Debug, Deserialize)]
+pub struct UpdateNotificationPrefsRequest {
+    pub broadcast: Option<bool>,
+    pub thread_reply: Option<bool>,
+    pub dm: Option<bool>,
 }
 
 /// Public projection of a user, safe to return in API responses.
@@ -140,6 +187,13 @@ pub struct UserPublic {
     /// user's verification state is never exposed to other users.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email_verified: Option<bool>,
+    /// Only populated on self endpoints; None elsewhere so a user's
+    /// preferences are never exposed to other users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_prefs: Option<NotificationPrefs>,
+    /// Self-only: whether the caller has MFA enabled. None elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -169,6 +223,34 @@ pub struct AuthResponse {
     pub token_type: &'static str,
     pub expires_in: i64,
     pub user: UserPublic,
+}
+
+/// Login can either complete (tokens) or require a second factor. The client
+/// distinguishes on `mfa_required`.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum LoginOutcome {
+    Authenticated(AuthResponse),
+    MfaChallenge {
+        mfa_required: bool,
+        mfa_token: String,
+    },
+}
+
+/// Body for `POST /auth/mfa/verify`: the challenge token + a TOTP code.
+#[derive(Debug, Deserialize, Validate)]
+pub struct MfaVerifyRequest {
+    #[validate(length(min = 1))]
+    pub mfa_token: String,
+    #[validate(length(min = 6, max = 8))]
+    pub code: String,
+}
+
+/// Body for MFA enroll confirm / disable: just a TOTP code.
+#[derive(Debug, Deserialize, Validate)]
+pub struct MfaCodeRequest {
+    #[validate(length(min = 6, max = 8))]
+    pub code: String,
 }
 
 #[derive(Debug, Deserialize, Validate)]

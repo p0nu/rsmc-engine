@@ -75,6 +75,9 @@ services:
         APP__EMAIL__SMTP_PASSWORD: ${APP__EMAIL__SMTP_PASSWORD:-}
         APP__EMAIL__FROM_ADDRESS: ${APP__EMAIL__FROM_ADDRESS:-no-reply@rsmc.local}
         APP__EMAIL__PUBLIC_BASE_URL: ${APP__EMAIL__PUBLIC_BASE_URL:-}
+        # Message retention (0 = keep forever) and GDPR account-deletion policy.
+        APP__RETENTION__DAYS: ${APP__RETENTION__DAYS:-0}
+        APP__GDPR__DELETION_MODE: ${APP__GDPR__DELETION_MODE:-anonymize}
       ports:
         - "8080:8080"
       volumes:

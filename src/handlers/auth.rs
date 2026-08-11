@@ -7,7 +7,15 @@ use crate::models::user::{
     AuthResponse, LoginRequest, RefreshRequest, SignupRequest, User, UserRole,
 };
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
+
+/// Extract a bounded User-Agent string from request headers (no IP, ever).
+fn ua(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(255).collect())
+}
 use base64::Engine;
 use chrono::Utc;
 use uuid::Uuid;
@@ -20,6 +28,7 @@ fn token_fingerprint(jti: Uuid) -> String {
 /// `POST /api/v1/auth/signup`
 pub async fn signup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<SignupRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     // Enforce uniqueness up front for a friendly error (race still caught by DB).
@@ -54,7 +63,8 @@ pub async fn signup(
         INSERT INTO users (id, email, username, display_name, password_hash, role, email_verified)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, email, username, display_name, password_hash, role,
-                  avatar_url, is_active, created_at, updated_at
+                  avatar_url, is_active, created_at, updated_at,
+                  notify_broadcast, notify_thread_reply, notify_dm
         "#,
     )
     .bind(Uuid::new_v4())
@@ -74,7 +84,7 @@ pub async fn signup(
         tracing::warn!(error = %e, "could not add user to default channel");
     }
 
-    issue_session(&state, &user).await
+    issue_session(&state, &user, ua(&headers)).await
 }
 
 /// Name of the channel every new user is automatically added to.
@@ -140,12 +150,14 @@ async fn ensure_default_membership(
 /// `POST /api/v1/auth/login`
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<LoginRequest>,
-) -> AppResult<Json<AuthResponse>> {
+) -> AppResult<Json<crate::models::user::LoginOutcome>> {
     let user: Option<User> = sqlx::query_as::<_, User>(
         r#"
         SELECT id, email, username, display_name, password_hash, role,
-               avatar_url, is_active, created_at, updated_at
+               avatar_url, is_active, created_at, updated_at,
+               notify_broadcast, notify_thread_reply, notify_dm
         FROM users WHERE LOWER(email) = LOWER($1)
         "#,
     )
@@ -185,12 +197,83 @@ pub async fn login(
         }
     }
 
-    issue_session(&state, &user).await
+    // If MFA is enabled, do NOT issue tokens yet. Return a short-lived challenge
+    // the client exchanges via /auth/mfa/verify with a valid TOTP code.
+    let mfa_enabled: bool = sqlx::query_scalar("SELECT mfa_enabled FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(&state.db)
+        .await?;
+    if mfa_enabled {
+        let challenge = state.jwt.issue_mfa_challenge(user.id, user.role)?;
+        return Ok(Json(crate::models::user::LoginOutcome::MfaChallenge {
+            mfa_required: true,
+            mfa_token: challenge,
+        }));
+    }
+
+    let resp = issue_session(&state, &user, ua(&headers)).await?;
+    Ok(Json(crate::models::user::LoginOutcome::Authenticated(resp.0)))
+}
+
+/// `POST /api/v1/auth/mfa/verify` - complete an MFA login.
+pub async fn mfa_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ValidatedJson(req): ValidatedJson<crate::models::user::MfaVerifyRequest>,
+) -> AppResult<Json<AuthResponse>> {
+    // Validate the challenge token (must be the Mfa kind).
+    let claims = state
+        .jwt
+        .verify(&req.mfa_token, crate::auth::jwt::TokenKind::Mfa)
+        .map_err(|_| AppError::Unauthorized)?;
+
+    // Load the user + encrypted secret.
+    let row: Option<(User, Option<String>, bool)> = {
+        let user: Option<User> = sqlx::query_as::<_, User>(
+            r#"
+            SELECT id, email, username, display_name, password_hash, role,
+                   avatar_url, is_active, created_at, updated_at,
+                   notify_broadcast, notify_thread_reply, notify_dm
+            FROM users WHERE id = $1
+            "#,
+        )
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await?;
+        match user {
+            Some(u) => {
+                let (enc, enabled): (Option<String>, bool) = sqlx::query_as(
+                    "SELECT mfa_secret_enc, mfa_enabled FROM users WHERE id = $1",
+                )
+                .bind(claims.sub)
+                .fetch_one(&state.db)
+                .await?;
+                Some((u, enc, enabled))
+            }
+            None => None,
+        }
+    };
+
+    let (user, enc, enabled) = row.ok_or(AppError::Unauthorized)?;
+    if !enabled {
+        return Err(AppError::Unauthorized);
+    }
+    let enc = enc.ok_or(AppError::Unauthorized)?;
+    let secret = crate::services::mfa::decrypt_secret(&state.config.auth.jwt_secret, &enc)
+        .map_err(|_| AppError::Unauthorized)?;
+
+    if !crate::services::mfa::verify(&secret, &req.code) {
+        return Err(AppError::Unauthorized);
+    }
+
+    let resp = issue_session(&state, &user, ua(&headers)).await?;
+    Ok(resp)
 }
 
 /// `POST /api/v1/auth/refresh`
 pub async fn refresh(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<RefreshRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     let claims = state.jwt.verify(&req.refresh_token, TokenKind::Refresh)?;
@@ -218,7 +301,8 @@ pub async fn refresh(
     let user: User = sqlx::query_as::<_, User>(
         r#"
         SELECT id, email, username, display_name, password_hash, role,
-               avatar_url, is_active, created_at, updated_at
+               avatar_url, is_active, created_at, updated_at,
+               notify_broadcast, notify_thread_reply, notify_dm
         FROM users WHERE id = $1
         "#,
     )
@@ -231,7 +315,7 @@ pub async fn refresh(
         return Err(AppError::Unauthorized);
     }
 
-    issue_session(&state, &user).await
+    issue_session(&state, &user, ua(&headers)).await
 }
 
 /// `POST /api/v1/auth/logout` - revokes all refresh tokens for the user.
@@ -244,19 +328,26 @@ pub async fn logout(State(state): State<AppState>, user: AuthUser) -> AppResult<
 }
 
 /// Shared helper: mint tokens, persist the refresh token, and build response.
-async fn issue_session(state: &AppState, user: &User) -> AppResult<Json<AuthResponse>> {
+/// `user_agent` is captured for session management (never an IP); None when
+/// unavailable.
+async fn issue_session(
+    state: &AppState,
+    user: &User,
+    user_agent: Option<String>,
+) -> AppResult<Json<AuthResponse>> {
     let pair = state.jwt.issue_pair(user.id, user.role)?;
 
     sqlx::query(
         r#"
-        INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, user_agent, last_used_at)
+        VALUES ($1, $2, $3, $4, $5, now())
         "#,
     )
     .bind(Uuid::new_v4())
     .bind(user.id)
     .bind(token_fingerprint(pair.refresh_jti))
     .bind(pair.refresh_expires_at)
+    .bind(user_agent.as_deref())
     .execute(&state.db)
     .await?;
 
@@ -271,6 +362,10 @@ async fn issue_session(state: &AppState, user: &User) -> AppResult<Json<AuthResp
             .unwrap_or(true);
     let mut public = user.to_public();
     public.email_verified = Some(email_verified);
+    // Include the caller's own notification preferences so the client has them
+    // immediately after login/signup/refresh (not only after a later
+    // /users/me call), mirroring how email_verified is populated above.
+    public.notification_prefs = Some(user.notification_prefs());
 
     Ok(Json(AuthResponse {
         access_token: pair.access,

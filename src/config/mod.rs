@@ -26,6 +26,10 @@ pub struct Settings {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub email: EmailConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub gdpr: GdprConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,6 +285,52 @@ fn default_write_max() -> u32 {
 }
 fn default_write_window_secs() -> u64 {
     10
+}
+
+/// Message retention: when enabled with a positive `days`, a background sweep
+/// soft-deletes messages older than that many days. 0 (the default) disables
+/// retention entirely, messages are kept forever. Admin-configurable per
+/// instance via config or APP__RETENTION__* env vars.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Age threshold in days. 0 disables retention.
+    #[serde(default)]
+    pub days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { days: 0 }
+    }
+}
+
+/// GDPR / account-deletion policy, admin-configurable per instance.
+///
+/// - "anonymize" (default): the user row is scrubbed to a tombstone and their
+///   messages are kept but attributed to a deleted placeholder, so threads and
+///   history stay coherent.
+/// - "hard_delete": the user's messages and uploads are removed, then the user
+///   row is deleted outright.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GdprConfig {
+    pub deletion_mode: DeletionMode,
+}
+
+impl Default for GdprConfig {
+    fn default() -> Self {
+        Self {
+            deletion_mode: DeletionMode::Anonymize,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionMode {
+    Anonymize,
+    HardDelete,
 }
 
 impl Settings {

@@ -10,6 +10,7 @@ pub mod compose;
 pub mod email;
 pub mod files;
 pub mod health;
+pub mod metrics;
 pub mod messages;
 pub mod notifications;
 pub mod presence;

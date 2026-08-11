@@ -14,6 +14,9 @@ use uuid::Uuid;
 pub enum TokenKind {
     Access,
     Refresh,
+    /// Short-lived token proving password success, exchanged for a real pair
+    /// after a valid TOTP code. Cannot be used as access or refresh.
+    Mfa,
 }
 
 /// JWT claims. `sub` is the user id.
@@ -58,6 +61,12 @@ impl JwtKeys {
 
     pub fn access_ttl(&self) -> i64 {
         self.access_ttl
+    }
+
+    /// Issue a short-lived MFA challenge token (5 minutes). Proves the password
+    /// step succeeded; the client must present a valid TOTP code to exchange it.
+    pub fn issue_mfa_challenge(&self, user_id: Uuid, role: UserRole) -> AppResult<String> {
+        self.issue(user_id, role, TokenKind::Mfa, 300)
     }
 
     /// Issue a new access + refresh pair for a user.
