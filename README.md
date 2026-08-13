@@ -66,8 +66,8 @@ so the engine will not start until both are set. Generate a secret with
 
 Every tagged release attaches ready-to-run binaries (packaged as `.tar.gz`): a
 static Linux build (`x86_64-unknown-linux-musl`) that runs on any distro with no
-dependencies, and an Apple Silicon macOS build (`aarch64-apple-darwin`). Grab the
-latest from the [Releases page](https://github.com/p0nu/rsmc-engine/releases).
+dependencies, and an Apple Silicon macOS build (`aarch64-apple-darwin`).
+Refer the the [Releases page](https://github.com/p0nu/rsmc-engine/releases).
 
 > **Prerequisite: a running [PostgreSQL](https://www.postgresql.org/download/)**
 > (any recent version). The binary connects to an existing database and creates
