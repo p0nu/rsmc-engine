@@ -204,7 +204,7 @@ curl localhost:8080/healthz
 
 Then run [rsmc-ui](https://github.com/p0nu/rsmc-ui) against the engine and **sign
 up through the app** , the first account you create becomes the workspace admin.
-Use your own email and a password you choose; don't reuse example values.
+Use your own email and a password you choose.
 
 Building your own frontend instead? See the [API](docs/API.md) and
 [integration guide](docs/INTEGRATION.md). Signup is a `POST /api/v1/auth/signup`
