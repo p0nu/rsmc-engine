@@ -20,8 +20,19 @@ async fn main() -> anyhow::Result<()> {
         "starting rsmc-engine"
     );
 
-    // Ensure the upload directory exists before we start accepting traffic.
-    tokio::fs::create_dir_all(&settings.storage.upload_dir).await.ok();
+    // Ensure the upload directory exists AND is writable before accepting
+    // traffic. A silent failure here is the classic cause of "uploads don't
+    // work" (wrong permissions / read-only location), so fail loudly at boot
+    // with an actionable message instead of surfacing generic 500s per upload.
+    let upload_dir = &settings.storage.upload_dir;
+    tokio::fs::create_dir_all(upload_dir).await.map_err(|e| {
+        anyhow::anyhow!("cannot create upload directory '{upload_dir}': {e}. Check the path and that the process user can write to it.")
+    })?;
+    let probe = std::path::Path::new(upload_dir).join(".rsmc-write-test");
+    tokio::fs::write(&probe, b"ok").await.map_err(|e| {
+        anyhow::anyhow!("upload directory '{upload_dir}' is not writable: {e}. Fix its permissions (in Docker, ensure the mounted volume is writable by the container user).")
+    })?;
+    let _ = tokio::fs::remove_file(&probe).await;
 
     let bind = settings.bind_addr();
     let state = rsmc_engine::bootstrap(settings).await?;

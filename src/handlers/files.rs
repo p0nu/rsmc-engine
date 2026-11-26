@@ -52,23 +52,34 @@ pub async fn upload(
         let storage_name = format!("{id}");
         let path = dir.join(&storage_name);
 
-        // Stream to disk while enforcing the size cap.
+        // Stream the field to disk chunk by chunk, enforcing the size cap as we
+        // go. This bounds memory to one chunk regardless of file size (the old
+        // `field.bytes()` buffered the entire upload in RAM) and rejects an
+        // oversized upload early instead of after fully buffering it.
         let mut file = tokio::fs::File::create(&path)
             .await
             .map_err(|e| AppError::Internal(format!("cannot create file: {e}")))?;
         let mut written: usize = 0;
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        written += data.len();
-        if written > max {
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(AppError::BadRequest("file exceeds maximum size".into()));
+        let mut field = field;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(AppError::BadRequest(e.to_string()));
+                }
+            };
+            written += chunk.len();
+            if written > max {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(AppError::BadRequest("file exceeds maximum size".into()));
+            }
+            if let Err(e) = file.write_all(&chunk).await {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(AppError::Internal(format!("write failed: {e}")));
+            }
         }
-        file.write_all(&data)
-            .await
-            .map_err(|e| AppError::Internal(format!("write failed: {e}")))?;
         file.flush().await.ok();
 
         let attachment: Attachment = sqlx::query_as::<_, Attachment>(

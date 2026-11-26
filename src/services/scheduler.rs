@@ -94,7 +94,7 @@ pub async fn sweep_once(state: &AppState) -> crate::error::AppResult<usize> {
                 INSERT INTO messages (id, channel_id, user_id, content, parent_id)
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                          edited_at, deleted_at, created_at
+                          edited_at, deleted_at, created_at, message_type
                 "#,
             )
             .bind(Uuid::new_v4())

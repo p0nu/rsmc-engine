@@ -5,12 +5,22 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+fn default_message_type() -> String {
+    "user".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Message {
     pub id: Uuid,
     pub channel_id: Uuid,
-    pub user_id: Uuid,
+    /// None for system messages (e.g. "<user> joined"); set for user messages.
+    pub user_id: Option<Uuid>,
     pub content: String,
+    /// "user" (default) or "system". System messages have no author and are
+    /// rendered differently by clients.
+    #[serde(default = "default_message_type")]
+    #[sqlx(default)]
+    pub message_type: String,
     /// When set, this message is a reply within a thread rooted at the parent.
     pub parent_id: Option<Uuid>,
     /// Denormalized count of replies for thread-root messages.
@@ -42,7 +52,9 @@ pub struct ReactionGroup {
 pub struct MessageView {
     #[serde(flatten)]
     pub message: Message,
-    pub author: super::user::UserPublic,
+    /// None for system messages (which have no author).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<super::user::UserPublic>,
     #[serde(default)]
     pub attachments: Vec<super::file::Attachment>,
     #[serde(default)]

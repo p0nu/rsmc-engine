@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.11.0] - join/leave messages, upload robustness, and request timeouts
+
+### Added
+- **Channel join/leave system messages.** A user joining or leaving a channel
+  now posts a system message to the feed ("`<name>` joined the channel",
+  "`<name>` left the channel", or "`<name>` was removed from the channel" for an
+  admin removal). These are authorless `message_type = 'system'` messages,
+  broadcast live and persisted in history. Fires on signup auto-join to the
+  default channel, on self-join via browse, and on admin add/remove. New
+  additive migration (0013) adds a `message_type` column and makes `user_id`
+  nullable; existing rows default to `'user'` and are unaffected.
+- **Live member-list updates on join.** The signup auto-join now emits a
+  `member_joined` event, so already-connected clients (e.g. an admin viewing the
+  members list) see a new member appear without a refresh.
+
+### Changed
+- **Streaming file uploads.** Uploads are now written to disk chunk by chunk with
+  the size cap enforced as they stream, instead of buffering the whole file in
+  memory first. This bounds memory use regardless of file size and rejects an
+  oversized upload early rather than after fully reading it.
+- **HTTP request timeout.** A per-request timeout (120s) is applied so a slow or
+  stuck client cannot hold a handler open indefinitely. WebSocket upgrades are
+  unaffected (the long-lived socket lives outside the HTTP request).
+
+### Fixed
+- **Upload directory is validated at startup.** The engine now checks that the
+  upload directory exists and is writable before accepting traffic, failing with
+  an actionable message instead of surfacing generic errors on the first upload.
+- **Avatar uploads accept images sent as `application/octet-stream`.** Image
+  detection now also considers the file extension and magic bytes, so valid
+  images that a client labels generically are no longer wrongly rejected.
+
 ## [0.10.0] - MFA, GDPR, sessions, audit, retention, metrics, and real SMTP
 
 ### Added

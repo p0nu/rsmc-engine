@@ -31,6 +31,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 /// Build the full router: REST + WebSocket under `/api/v1`, health probes at root.
@@ -255,6 +256,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(handlers::health::readyz))
         .route("/metrics", get(handlers::metrics::metrics))
         .nest("/api/v1", api)
+        // Cap how long a single HTTP request may take, so a slow or stuck client
+        // cannot hold a handler open indefinitely (slowloris-style resource
+        // exhaustion). This times out the HTTP request/response only; a
+        // WebSocket upgrade returns quickly and the upgraded, long-lived socket
+        // lives outside this layer, so realtime is unaffected. The window is
+        // generous enough for large uploads over slow links.
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(120)))
         .layer(TraceLayer::new_for_http())
         // Raise both body limits: RequestBodyLimitLayer caps the raw body,
         // DefaultBodyLimit caps what extractors (incl. Multipart) buffer

@@ -1,6 +1,6 @@
 [package]
 name = "rsmc-engine"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 authors = ["RSMC Engine Contributors"]
 description = "A production-ready, plug-and-play team-collaboration backend engine written in Rust"
@@ -25,7 +25,7 @@ tokio-stream = "0.1"
 axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "timeout"] }
 hyper = { version = "1.4", features = ["full"] }
 
 # Database

@@ -22,7 +22,8 @@ pub(crate) async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResul
     if messages.is_empty() {
         return Ok(vec![]);
     }
-    let author_ids: Vec<Uuid> = messages.iter().map(|m| m.user_id).collect();
+    // System messages have no author (user_id is None), so skip them here.
+    let author_ids: Vec<Uuid> = messages.iter().filter_map(|m| m.user_id).collect();
     let message_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
 
     // Fetch all distinct authors in one query.
@@ -100,10 +101,14 @@ pub(crate) async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResul
     Ok(messages
         .into_iter()
         .map(|m| {
-            let author = author_map
-                .get(&m.user_id)
-                .cloned()
-                .unwrap_or_else(|| placeholder_user(m.user_id));
+            // System messages have no author; user messages resolve theirs
+            // (falling back to a placeholder if the account is gone).
+            let author = m.user_id.map(|uid| {
+                author_map
+                    .get(&uid)
+                    .cloned()
+                    .unwrap_or_else(|| placeholder_user(uid))
+            });
             let attachments = att_map.remove(&m.id).unwrap_or_default();
             let reactions = react_map.remove(&m.id).unwrap_or_default();
             MessageView {
@@ -114,6 +119,45 @@ pub(crate) async fn enrich(state: &AppState, messages: Vec<Message>) -> AppResul
             }
         })
         .collect())
+}
+
+/// Post a system message (no author) to a channel and broadcast it live, so it
+/// appears in the feed like "<user> joined the channel". Best-effort: a failure
+/// is logged and swallowed, never bubbled to the caller's main operation.
+pub(crate) async fn post_system_message(state: &AppState, channel_id: Uuid, content: String) {
+    let inserted: Result<Message, _> = sqlx::query_as::<_, Message>(
+        r#"
+        INSERT INTO messages (id, channel_id, user_id, content, message_type)
+        VALUES ($1, $2, NULL, $3, 'system')
+        RETURNING id, channel_id, user_id, content, parent_id, reply_count,
+                  edited_at, deleted_at, created_at, message_type
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(channel_id)
+    .bind(&content)
+    .fetch_one(&state.db)
+    .await;
+
+    let message = match inserted {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not post system message");
+            return;
+        }
+    };
+
+    if let Ok(mut views) = enrich(state, vec![message]).await {
+        if let Some(view) = views.pop() {
+            state.events.emit_channel(
+                channel_id,
+                ServerEvent::MessageCreated {
+                    channel_id,
+                    message: Box::new(view),
+                },
+            );
+        }
+    }
 }
 
 fn placeholder_user(id: Uuid) -> UserPublic {
@@ -184,7 +228,7 @@ pub async fn send_message(
         INSERT INTO messages (id, channel_id, user_id, content, parent_id)
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                  edited_at, deleted_at, created_at
+                  edited_at, deleted_at, created_at, message_type
         "#,
     )
     .bind(Uuid::new_v4())
@@ -312,7 +356,7 @@ async fn dispatch_notifications(
         .fetch_optional(&state.db)
         .await
         {
-            if author != view.message.user_id {
+            if Some(author) != view.message.user_id {
                 let _ = notifications::notify(
                     &state.db,
                     &state.events,
@@ -442,7 +486,7 @@ pub async fn history(
         sqlx::query_as::<_, Message>(
             r#"
             SELECT id, channel_id, user_id, content, parent_id, reply_count,
-                   edited_at, deleted_at, created_at, pinned_at, pinned_by
+                   edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
             FROM messages
             WHERE channel_id = $1 AND parent_id IS NULL
             ORDER BY created_at DESC, id DESC
@@ -494,7 +538,7 @@ pub async fn thread(
     let replies: Vec<Message> = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, channel_id, user_id, content, parent_id, reply_count,
-               edited_at, deleted_at, created_at, pinned_at, pinned_by
+               edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
         FROM messages
         WHERE parent_id = $1
         ORDER BY created_at ASC
@@ -529,7 +573,7 @@ pub async fn edit_message(
         UPDATE messages SET content = $2, edited_at = now()
         WHERE id = $1
         RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                  edited_at, deleted_at, created_at, pinned_at, pinned_by
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
         "#,
     )
     .bind(message_id)
@@ -812,7 +856,7 @@ pub async fn pin_message(
         SET pinned_at = COALESCE(pinned_at, now()), pinned_by = $2
         WHERE id = $1 AND deleted_at IS NULL
         RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                  edited_at, deleted_at, created_at, pinned_at, pinned_by
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
         "#,
     )
     .bind(message_id)
@@ -846,7 +890,7 @@ pub async fn unpin_message(
         SET pinned_at = NULL, pinned_by = NULL
         WHERE id = $1 AND deleted_at IS NULL
         RETURNING id, channel_id, user_id, content, parent_id, reply_count,
-                  edited_at, deleted_at, created_at, pinned_at, pinned_by
+                  edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
         "#,
     )
     .bind(message_id)
@@ -895,7 +939,7 @@ pub async fn list_pins(
     let messages: Vec<Message> = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, channel_id, user_id, content, parent_id, reply_count,
-               edited_at, deleted_at, created_at, pinned_at, pinned_by
+               edited_at, deleted_at, created_at, pinned_at, pinned_by, message_type
         FROM messages
         WHERE channel_id = $1 AND pinned_at IS NOT NULL AND deleted_at IS NULL
           AND ($2::timestamptz IS NULL OR pinned_at < $2)

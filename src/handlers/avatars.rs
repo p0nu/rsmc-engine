@@ -54,13 +54,7 @@ pub async fn upload_avatar(
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-
-        // Images only.
-        if !content_type.starts_with("image/") {
-            return Err(AppError::BadRequest(
-                "avatar must be an image".into(),
-            ));
-        }
+        let filename = field.file_name().unwrap_or("").to_ascii_lowercase();
 
         let data = field
             .bytes()
@@ -73,6 +67,21 @@ pub async fn upload_avatar(
         }
         if data.is_empty() {
             return Err(AppError::BadRequest("avatar file is empty".into()));
+        }
+
+        // Accept an image if ANY reliable signal says so: the declared
+        // content-type, a known image extension, or the file's magic bytes.
+        // Relying on content-type alone wrongly rejects real images that some
+        // clients upload as "application/octet-stream".
+        let ct_is_image = content_type.starts_with("image/");
+        let ext_is_image = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]
+            .iter()
+            .any(|e| filename.ends_with(e));
+        let bytes_are_image = looks_like_image(&data);
+        if !(ct_is_image || ext_is_image || bytes_are_image) {
+            return Err(AppError::BadRequest(
+                "avatar must be an image (PNG, JPEG, GIF, or WebP)".into(),
+            ));
         }
 
         // Store under a stable per-user filename so old files are overwritten.
@@ -183,4 +192,19 @@ pub async fn serve_avatar(
         .body(Body::from(bytes))
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(response.into_response())
+}
+
+/// Best-effort check that bytes are a common image, by magic number. Covers
+/// PNG, JPEG, GIF, WebP, and BMP. Used as one of several signals so that images
+/// uploaded as "application/octet-stream" are still accepted.
+fn looks_like_image(data: &[u8]) -> bool {
+    if data.len() < 12 {
+        return false;
+    }
+    let png = &data[..8] == b"\x89PNG\r\n\x1a\n";
+    let jpeg = data[..3] == [0xFF, 0xD8, 0xFF];
+    let gif = &data[..6] == b"GIF87a" || &data[..6] == b"GIF89a";
+    let webp = &data[..4] == b"RIFF" && &data[8..12] == b"WEBP";
+    let bmp = &data[..2] == b"BM";
+    png || jpeg || gif || webp || bmp
 }

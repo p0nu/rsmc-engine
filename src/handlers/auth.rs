@@ -80,8 +80,30 @@ pub async fn signup(
     // Default channel: the first user creates "general" (and owns it); every
     // user is then auto-added as a member so the workspace is never empty.
     // Best-effort - a failure here must not block account creation.
-    if let Err(e) = ensure_default_membership(&state, user.id, role).await {
-        tracing::warn!(error = %e, "could not add user to default channel");
+    match ensure_default_membership(&state, user.id, role).await {
+        Ok(channel_id) => {
+            // Broadcast the new member so already-connected clients (e.g. the
+            // admin viewing the members list) see them appear live, without a
+            // refresh, and post a visible "<user> joined" line to the channel.
+            state.events.emit_channel(
+                channel_id,
+                crate::models::ws_protocol::ServerEvent::MemberJoined {
+                    channel_id,
+                    user: user.to_public(),
+                },
+            );
+            // Visible feed line, same as the deliberate-join paths. Requested so
+            // existing members can see when someone new joins the workspace.
+            super::messages::post_system_message(
+                &state,
+                channel_id,
+                format!("{} joined the channel", user.display_name),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not add user to default channel");
+        }
     }
 
     issue_session(&state, &user, ua(&headers)).await
@@ -96,7 +118,7 @@ async fn ensure_default_membership(
     state: &AppState,
     user_id: Uuid,
     role: UserRole,
-) -> AppResult<()> {
+) -> AppResult<Uuid> {
     // Find the default channel, or create it if missing. Only the first admin
     // (who has no one to inherit it from) creates it, as its owner.
     let existing: Option<Uuid> = sqlx::query_scalar(
@@ -144,7 +166,7 @@ async fn ensure_default_membership(
     .execute(&state.db)
     .await?;
 
-    Ok(())
+    Ok(channel_id)
 }
 
 /// `POST /api/v1/auth/login`

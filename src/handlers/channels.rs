@@ -420,6 +420,7 @@ pub async fn add_member(
     // Realtime: broadcast the new member so other members' rosters update live.
     if res.rows_affected() > 0 {
         if let Ok(joined) = load_public(&state, req.user_id).await {
+            let name = joined.display_name.clone();
             state.events.emit_channel(
                 id,
                 ServerEvent::MemberJoined {
@@ -427,6 +428,12 @@ pub async fn add_member(
                     user: joined,
                 },
             );
+            super::messages::post_system_message(
+                &state,
+                id,
+                format!("{name} joined the channel"),
+            )
+            .await;
         }
     }
     Ok(super::ok())
@@ -489,6 +496,18 @@ pub async fn remove_member(
             user_id: target,
         },
     );
+
+    // Visible feed line. Distinguish a voluntary leave from an admin removal
+    // (self-leave when the target removed themselves). The removing admin is
+    // deliberately not named.
+    if let Ok(who) = load_public(&state, target).await {
+        let text = if target == user.id {
+            format!("{} left the channel", who.display_name)
+        } else {
+            format!("{} was removed from the channel", who.display_name)
+        };
+        super::messages::post_system_message(&state, id, text).await;
+    }
     Ok(super::ok())
 }
 
@@ -607,6 +626,7 @@ pub async fn join_channel(
     // Broadcast only on a genuine first join.
     if res.rows_affected() > 0 {
         if let Ok(joined) = load_public(&state, user.id).await {
+            let name = joined.display_name.clone();
             state.events.emit_channel(
                 id,
                 ServerEvent::MemberJoined {
@@ -614,6 +634,13 @@ pub async fn join_channel(
                     user: joined,
                 },
             );
+            // Visible feed line: "<name> joined the channel".
+            super::messages::post_system_message(
+                &state,
+                id,
+                format!("{name} joined the channel"),
+            )
+            .await;
         }
     }
     Ok(super::ok())
