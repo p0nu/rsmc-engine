@@ -226,6 +226,11 @@ pub fn build_router(state: AppState) -> Router {
             "/webhooks/:id",
             delete(handlers::webhooks::delete_webhook),
         )
+        // ---- instance settings (GET any user, PUT admin only) ----
+        .route(
+            "/settings",
+            get(handlers::settings::get_settings).put(handlers::settings::update_settings),
+        )
         // ---- system (admin) ----
         .route("/system/info", get(handlers::system::info))
         .route("/system/stats", get(handlers::system::stats))
@@ -273,8 +278,20 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// CORS from configured origins: `*` or empty = any-origin; else explicit allowlist.
+/// CORS from configured origins: `*` or empty = any-origin (no credentials);
+/// else an explicit allowlist that permits credentials.
+///
+/// The two branches are not symmetric, and deliberately so. The CORS spec
+/// forbids combining `Access-Control-Allow-Credentials: true` with a wildcard
+/// (`Any`) for origin OR for headers: a credentialed response must name its
+/// allowed origins and headers explicitly. So the wildcard branch does NOT set
+/// credentials, and the allowlist branch names concrete methods and headers
+/// instead of `Any`. Sending `Any` headers together with credentials makes
+/// `tower-http` panic at startup, which is how a production deployment that set
+/// a real origin would otherwise crash.
 fn build_cors(state: &AppState) -> CorsLayer {
+    use axum::http::{header, Method};
+
     let origins = &state.config.server.cors_origins;
     if origins.is_empty() || origins.iter().any(|o| o == "*") {
         CorsLayer::new()
@@ -288,8 +305,15 @@ fn build_cors(state: &AppState) -> CorsLayer {
             .collect();
         CorsLayer::new()
             .allow_origin(parsed)
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
             .allow_credentials(true)
     }
 }

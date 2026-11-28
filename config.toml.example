@@ -31,6 +31,12 @@ auto_migrate = true
 [auth]
 # Prefer setting this via JWT_SECRET env var. Must be >= 16 characters.
 jwt_secret = "change-me-to-a-long-random-secret-value"
+# Optional dedicated key for encrypting MFA/TOTP secrets at rest. When empty,
+# the MFA key is derived from jwt_secret (rotating jwt_secret would then force
+# MFA users to re-enroll). Set it (>= 16 chars) to decouple the two, so rotating
+# jwt_secret logs users out without making stored TOTP secrets undecryptable.
+# Prefer setting this via the MFA_ENCRYPTION_KEY env var.
+mfa_encryption_key = ""
 access_token_ttl_secs = 3600      # 1 hour
 refresh_token_ttl_secs = 2592000  # 30 days
 

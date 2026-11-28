@@ -1,0 +1,53 @@
+# RSMC reverse proxy (Caddy).
+#
+# Caddy terminates TLS, serves the built frontend as static files, and reverse
+# proxies API and WebSocket traffic to the engine. It is the only service
+# exposed to the outside; the engine, Postgres and Redis stay on the internal
+# Docker network.
+#
+# The site address controls TLS:
+#   - rsmc.localhost         Caddy issues a locally-trusted cert from its own
+#                            internal CA (good for local testing).
+#   - your real domain       Caddy automatically gets a real certificate from
+#                            Let's Encrypt (just replace the address below and
+#                            make sure ports 80 and 443 are reachable).
+#
+# Override the address at run time with the SITE_ADDRESS env var.
+
+{$SITE_ADDRESS:rsmc.localhost} {
+	# API and WebSocket go to the engine. The engine listens on :8080 inside
+	# the Docker network under the service name "app". Caddy upgrades
+	# WebSocket connections automatically, so /api/v1/ws needs no special
+	# handling beyond routing to the same backend.
+	handle /api/* {
+		reverse_proxy app:8080
+	}
+
+	# Health and readiness endpoints, proxied so they are reachable through
+	# the front door too (handy for external uptime checks).
+	handle /healthz {
+		reverse_proxy app:8080
+	}
+	handle /readyz {
+		reverse_proxy app:8080
+	}
+
+	# Everything else is the built single-page frontend. try_files makes
+	# client-side routing work: unknown paths fall back to index.html instead
+	# of 404ing, so a deep link like /channel/general loads the app.
+	handle {
+		root * /srv/www
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Allow large uploads through the proxy. Without this a proxy can reject a
+	# big file before it reaches the engine, so the engine's own streaming
+	# upload and size cap never get a chance to run. Set this at or above the
+	# engine's configured maximum upload size.
+	request_body {
+		max_size 100MB
+	}
+
+	encode gzip
+}

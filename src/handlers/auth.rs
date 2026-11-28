@@ -281,7 +281,7 @@ pub async fn mfa_verify(
         return Err(AppError::Unauthorized);
     }
     let enc = enc.ok_or(AppError::Unauthorized)?;
-    let secret = crate::services::mfa::decrypt_secret(&state.config.auth.jwt_secret, &enc)
+    let secret = crate::services::mfa::decrypt_secret(state.config.auth.mfa_key(), &enc)
         .map_err(|_| AppError::Unauthorized)?;
 
     if !crate::services::mfa::verify(&secret, &req.code) {

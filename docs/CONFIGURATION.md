@@ -12,9 +12,10 @@ Settings are layered, later sources overriding earlier ones:
 |----------|---------|---------|
 | `DATABASE_URL` | (required) | PostgreSQL connection string |
 | `JWT_SECRET` | (required, >=16 chars) | HMAC secret for signing JWTs |
+| `MFA_ENCRYPTION_KEY` | unset (falls back to `JWT_SECRET`) | Key for encrypting MFA/TOTP secrets at rest; set it (>=16 chars) to decouple from `JWT_SECRET` |
 | `REDIS_URL` | unset | Enables multi-instance realtime fan-out (optional) |
 | `PORT` / `APP__SERVER__PORT` | `8080` | HTTP listen port |
-| `APP__SERVER__CORS_ORIGINS` | `*` | Comma-separated allowlist (`*` = any) |
+| `APP__SERVER__CORS_ORIGINS` | `*` | Comma-separated allowlist; `*` is dev-only, set a specific origin in production (see note) |
 | `APP__SERVER__MAX_BODY_BYTES` | `26214400` | Request body cap (25 MiB) |
 | `APP__AUTH__ACCESS_TOKEN_TTL_SECS` | `3600` | Access token lifetime |
 | `APP__AUTH__REFRESH_TOKEN_TTL_SECS` | `2592000` | Refresh token lifetime |
@@ -35,6 +36,28 @@ Settings are layered, later sources overriding earlier ones:
 | `APP__EMAIL__SMTP_PORT` | `587` | SMTP port |
 
 See `.env.example` for the full annotated list.
+
+## CORS in production
+
+`APP__SERVER__CORS_ORIGINS` defaults to `*` for local development. In
+production, set it to your actual origin (for example
+`https://chat.example.com`). The engine issues credentialed requests, and the
+CORS standard forbids combining credentials with a wildcard origin, so a
+wildcard is rejected at startup rather than silently serving an invalid policy.
+When the UI is served from the same origin as the API (the reverse-proxy
+setup in `docs/DEPLOY.md`), set this to that single origin.
+
+## MFA encryption key
+
+MFA/TOTP secrets are encrypted at rest. By default the encryption key is
+derived from `JWT_SECRET`, which means rotating `JWT_SECRET` (which also signs
+sessions) would make stored TOTP secrets undecryptable and force every MFA user
+to re-enroll. Set `MFA_ENCRYPTION_KEY` to a dedicated strong value to decouple
+the two: rotating `JWT_SECRET` then only logs users out, leaving MFA intact.
+It is optional and backward compatible (unset keeps the derived-key behavior),
+but new installs should set it. Note that enabling it on an instance that
+already has MFA users means those users must re-enroll, since their secrets
+were encrypted with the old derived key.
 
 ## Backup/restore & PostgreSQL client version
 

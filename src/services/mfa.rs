@@ -3,13 +3,14 @@
 //! - Secrets are 20 random bytes, presented to the user as base32 and as an
 //!   otpauth:// provisioning URI (for QR codes).
 //! - Secrets are stored ENCRYPTED at rest with AES-256-GCM. The key is derived
-//!   from the configured JWT secret via SHA-256.
+//!   via SHA-256 from the key material the caller passes in. Callers resolve
+//!   that via `AuthConfig::mfa_key()`: a dedicated `MFA_ENCRYPTION_KEY` when
+//!   set, otherwise `JWT_SECRET` as a backward-compatible fallback.
 //!
-//!   REVIEW NOTE (security): deriving the MFA encryption key from JWT_SECRET
-//!   couples the two. Rotating JWT_SECRET makes stored TOTP secrets
-//!   undecryptable (users must re-enroll). A dedicated MFA_ENCRYPTION_KEY would
-//!   decouple them; deferred to keep required config minimal. Flagged for review
-//!   before 1.0.
+//!   Setting `MFA_ENCRYPTION_KEY` decouples MFA encryption from `JWT_SECRET`,
+//!   so rotating `JWT_SECRET` (which logs users out) no longer makes stored
+//!   TOTP secrets undecryptable. When it is left unset the historical behavior
+//!   applies and rotating `JWT_SECRET` still forces re-enrollment.
 //!
 //! - Verification checks the current 30s step and +/-1 neighbor to tolerate
 //!   clock skew (a standard, deliberately small window).

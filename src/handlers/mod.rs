@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod messages;
 pub mod notifications;
 pub mod presence;
+pub mod settings;
 pub mod system;
 pub mod users;
 pub mod webhooks;

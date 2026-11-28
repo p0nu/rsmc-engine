@@ -423,7 +423,7 @@ pub async fn mfa_enroll(
     }
 
     let secret = crate::services::mfa::generate_secret();
-    let enc = crate::services::mfa::encrypt_secret(&state.config.auth.jwt_secret, &secret)
+    let enc = crate::services::mfa::encrypt_secret(state.config.auth.mfa_key(), &secret)
         .map_err(|_| AppError::Internal("mfa secret encryption failed".into()))?;
 
     // Fetch a label for the provisioning URI.
@@ -459,7 +459,7 @@ pub async fn mfa_confirm(
         .fetch_one(&state.db)
         .await?;
     let enc = enc.ok_or_else(|| AppError::BadRequest("no pending MFA enrollment".into()))?;
-    let secret = crate::services::mfa::decrypt_secret(&state.config.auth.jwt_secret, &enc)
+    let secret = crate::services::mfa::decrypt_secret(state.config.auth.mfa_key(), &enc)
         .map_err(|_| AppError::Internal("mfa secret decryption failed".into()))?;
 
     if !crate::services::mfa::verify(&secret, &req.code) {
@@ -500,7 +500,7 @@ pub async fn mfa_disable(
     .await?
     .flatten();
     let enc = enc.ok_or_else(|| AppError::BadRequest("MFA is not enabled".into()))?;
-    let secret = crate::services::mfa::decrypt_secret(&state.config.auth.jwt_secret, &enc)
+    let secret = crate::services::mfa::decrypt_secret(state.config.auth.mfa_key(), &enc)
         .map_err(|_| AppError::Internal("mfa secret decryption failed".into()))?;
 
     if !crate::services::mfa::verify(&secret, &req.code) {
@@ -545,6 +545,26 @@ pub async fn delete_my_account(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> AppResult<Json<serde_json::Value>> {
+    // Guard against the instance locking itself out of administration. If the
+    // last remaining admin deletes their own account, no one can administer the
+    // instance and there is no in-app way to create a new admin (promotion is
+    // itself admin-only). Refuse, and tell them to promote another admin first.
+    // Mirrors the self-deactivation guard in set_active.
+    if user.role == crate::models::user::UserRole::Admin {
+        let other_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users \
+             WHERE role = 'admin' AND is_active = TRUE AND id <> $1",
+        )
+        .bind(user.id)
+        .fetch_one(&state.db)
+        .await?;
+        if other_admins == 0 {
+            return Err(AppError::BadRequest(
+                "you are the last admin; promote another member to admin before deleting your account".into(),
+            ));
+        }
+    }
+
     let mode = state.config.gdpr.deletion_mode;
     crate::services::gdpr::delete_account(&state, user.id, mode)
         .await

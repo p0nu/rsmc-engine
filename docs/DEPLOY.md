@@ -50,6 +50,61 @@ binary does not bundle one (no chat backend does). If `DATABASE_URL` or
 `JWT_SECRET` is missing, or the database is unreachable, the engine exits
 immediately with an actionable message telling you exactly what to set.
 
+## Reverse proxy and TLS (serving the full app)
+
+The engine serves the API only. In development the frontend runs separately
+under Vite (`npm run dev`), which proxies API and WebSocket traffic to the
+engine so the browser talks to a single origin. That is a development
+convenience, not a production setup.
+
+For production, put a reverse proxy in front: it terminates TLS, serves the
+built frontend as static files, and proxies API and WebSocket traffic to the
+engine. The engine, PostgreSQL and Redis then stay on an internal network and
+are never exposed directly. A ready-to-use reference lives in `deploy/`:
+
+```
+deploy/Caddyfile                 Caddy config (TLS, static UI, API + WS proxy)
+deploy/docker-compose.prod.yml   Caddy + engine + PostgreSQL + Redis, with only
+                                 Caddy publishing ports to the host
+```
+
+Steps:
+
+1. **Build the frontend** in the `rsmc-ui` repo: `npm run build`, which writes
+   static files to `rsmc-ui/dist`.
+2. **Point the proxy at that build.** Set `UI_DIST` in `.env` to the absolute
+   path of `rsmc-ui/dist` (Caddy mounts it and serves it).
+3. **Set the site address.** `SITE_ADDRESS` in `.env` is the host Caddy serves.
+   Use a name like `rsmc.localhost` for local testing (Caddy issues a
+   locally-trusted certificate from its own CA) or your real domain in
+   production (Caddy obtains a Let's Encrypt certificate automatically, so
+   ports 80 and 443 must be reachable).
+4. **Lock CORS to that origin.** Behind the proxy the UI and API share one
+   origin, so set `CORS_ORIGINS` to exactly that origin, for example
+   `CORS_ORIGINS=https://chat.example.com`. Do NOT leave it as `*` in
+   production: the engine sends credentialed requests, and the CORS standard
+   forbids combining credentials with a wildcard, so a wildcard origin is
+   rejected at startup. `*` is for local development only.
+5. **Ensure the upload and backup directories are writable** by the container
+   user (uid 10001). The engine checks this at startup and exits with a clear
+   message if not:
+
+   ```bash
+   mkdir -p uploads backups
+   sudo chown -R 10001:10001 uploads backups
+   ```
+
+6. **Bring it up** from the `rsmc-engine` directory:
+
+   ```bash
+   docker compose --env-file .env -f deploy/docker-compose.prod.yml up --build
+   ```
+
+The engine's public URL (used in verification and password-reset email links)
+should match the proxy's externally visible address: set
+`APP__EMAIL__PUBLIC_BASE_URL` to it, for example
+`https://chat.example.com`. The reference compose sets this for you.
+
 ## Database lifecycle: development vs production
 
 The engine uses forward-only migrations. Each `migrations/000N_*.sql` is applied

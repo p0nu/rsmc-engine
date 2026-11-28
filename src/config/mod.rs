@@ -96,6 +96,14 @@ impl DatabaseConfig {
 pub struct AuthConfig {
     /// HMAC secret used to sign JWTs. MUST be set to a strong random value.
     pub jwt_secret: String,
+    /// Dedicated key for encrypting MFA/TOTP secrets at rest. Optional: when
+    /// empty, the MFA key falls back to being derived from `jwt_secret` (the
+    /// historical behavior, kept so existing installs are not broken). Set this
+    /// to a strong random value to decouple MFA encryption from `jwt_secret`,
+    /// so rotating `jwt_secret` logs users out without making stored TOTP
+    /// secrets undecryptable. See `mfa_key()`.
+    #[serde(default)]
+    pub mfa_encryption_key: String,
     /// Access token lifetime in seconds (default 1 hour).
     #[serde(default = "default_access_ttl")]
     pub access_token_ttl_secs: i64,
@@ -104,10 +112,25 @@ pub struct AuthConfig {
     pub refresh_token_ttl_secs: i64,
 }
 
+impl AuthConfig {
+    /// The key material used to encrypt/decrypt MFA secrets at rest. Uses the
+    /// dedicated `mfa_encryption_key` when set, otherwise falls back to
+    /// `jwt_secret` for backward compatibility with installs created before the
+    /// key was decoupled.
+    pub fn mfa_key(&self) -> &str {
+        if self.mfa_encryption_key.is_empty() {
+            &self.jwt_secret
+        } else {
+            &self.mfa_encryption_key
+        }
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             jwt_secret: String::new(),
+            mfa_encryption_key: String::new(),
             access_token_ttl_secs: default_access_ttl(),
             refresh_token_ttl_secs: default_refresh_ttl(),
         }
@@ -354,6 +377,9 @@ impl Settings {
         if let Ok(v) = std::env::var("JWT_SECRET") {
             builder = builder.set_override("auth.jwt_secret", v)?;
         }
+        if let Ok(v) = std::env::var("MFA_ENCRYPTION_KEY") {
+            builder = builder.set_override("auth.mfa_encryption_key", v)?;
+        }
         if let Ok(v) = std::env::var("REDIS_URL") {
             builder = builder.set_override("redis.url", v)?;
         }
@@ -406,6 +432,15 @@ impl Settings {
                 "JWT_SECRET is too short ({} chars); use at least 16 (32+ recommended).\n  \
                  export JWT_SECRET=$(openssl rand -hex 32)",
                 self.auth.jwt_secret.len()
+            );
+        }
+        // MFA_ENCRYPTION_KEY is optional (falls back to JWT_SECRET when unset),
+        // but if it is set it must be strong enough to serve as an encryption key.
+        if !self.auth.mfa_encryption_key.is_empty() && self.auth.mfa_encryption_key.len() < 16 {
+            anyhow::bail!(
+                "MFA_ENCRYPTION_KEY is set but too short ({} chars); use at least 16 (32+ recommended), or leave it unset to derive from JWT_SECRET.\n  \
+                 export MFA_ENCRYPTION_KEY=$(openssl rand -hex 32)",
+                self.auth.mfa_encryption_key.len()
             );
         }
         Ok(())

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.12.0] - MFA key decoupling and production hardening
+
+### Changed
+- **Dedicated MFA encryption key.** MFA/TOTP secrets can now be encrypted at rest
+  with a separate `MFA_ENCRYPTION_KEY` instead of a key derived from
+  `JWT_SECRET`. This decouples the two: rotating `JWT_SECRET` (which logs users
+  out) no longer makes stored TOTP secrets undecryptable. The key is optional
+  and backward compatible, when it is unset the MFA key falls back to being
+  derived from `JWT_SECRET`, so existing installs are unaffected. When set it
+  must be at least 16 characters (32+ recommended). New installs should set it.
+
+### Fixed
+- **CORS crash when a specific origin is configured.** With an explicit
+  `CORS_ORIGINS` allowlist (as any deployment behind a real domain uses), the
+  engine combined `Allow-Credentials: true` with wildcard `Allow-Headers`, an
+  illegal combination that made it panic at startup. The credentialed branch now
+  sends an explicit method and header allowlist, so configuring a real origin no
+  longer crashes the server. The wildcard (`*`, dev-only) path is unchanged.
+- **Last admin can no longer lock the instance out by deleting their account.**
+  Deleting your own account is now refused when you are the only remaining active
+  admin, with a message to promote another admin first. Without this the sole
+  admin could delete themselves, leaving the instance with no administrator and
+  no in-app way to create one. Mirrors the existing self-deactivation guard.
+
+### Added
+- **Reference reverse-proxy deployment.** A `deploy/` directory with a Caddy
+  config and a production Docker Compose file: Caddy terminates TLS, serves the
+  built frontend, and proxies API and WebSocket traffic to the engine, which
+  (along with Postgres and Redis) is no longer published to the host.
+- **Instance settings store.** A new `settings` table (migration `0014`) and a
+  `GET`/`PUT /settings` API for admin-editable, runtime instance configuration
+  that is not suited to environment variables. `GET` is readable by any
+  authenticated user; `PUT` is admin only. The first setting is `name_display`
+  (`full_name` or `username`), controlling how message authors are named in
+  channels.
+
 ## [0.11.0] - join/leave messages, upload robustness, and request timeouts
 
 ### Added
